@@ -46,6 +46,8 @@ namespace Imcs {
 Imcs *Imcs::m_instance{nullptr};
 std::once_flag Imcs::one;
 
+thread_local Imcs *current_imcs_instance = Imcs::instance();
+
 int Imcs::initialize() {
   m_inited.store(1);
   return 0;
@@ -96,12 +98,13 @@ int Imcs::load_table(const Rapid_load_context *context, const TABLE *source) {
   int tmp{HA_ERR_GENERIC};
   if (create_table_mem(context, source)) return HA_ERR_GENERIC;
 
-  std::ostringstream key_part, key;
-  key_part << source->s->db.str << ":" << source->s->table_name.str << ":";
+  // std::ostringstream key_part, key;
+  std::string key_part, key;
+  key_part.append(source->s->db.str).append(":").append(source->s->table_name.str).append(":");
   while ((tmp = source->file->ha_rnd_next(source->record[0])) != HA_ERR_END_OF_FILE) {
     /*** ha_rnd_next can return RECORD_DELETED for MyISAM when one thread is reading and another deleting
      without locks. Now, do full scan, but multi-thread scan will impl in future. */
-    key.str("");
+    key.clear();
     if (tmp == HA_ERR_KEY_NOT_FOUND) break;
 
     DBUG_EXECUTE_IF("secondary_engine_rapid_load_table_error", {
@@ -119,7 +122,7 @@ int Imcs::load_table(const Rapid_load_context *context, const TABLE *source) {
       auto fld = *(source->field + index);
       if (fld->is_flag_set(NOT_SECONDARY_FLAG)) continue;
 
-      key << key_part.str() << fld->field_name;
+      key.append(key_part).append(fld->field_name);
       auto extra_offset = Utils::Util::is_varstring(fld->type()) ? (fld->field_length > 256 ? 2 : 1) : 0;
       auto data_ptr = fld->is_null() ? nullptr : fld->field_ptr() + extra_offset;
       auto data_len = fld->is_null()
@@ -132,12 +135,18 @@ int Imcs::load_table(const Rapid_load_context *context, const TABLE *source) {
         data_len = fld->data_length(0);
       }
 
-      if (!m_cus[key.str()]->write_row(context, data_ptr, data_len)) {
-        my_error(ER_SECONDARY_ENGINE, MYF(0), source->s->db.str, source->s->table_name.str);
+      if (!m_cus[key]->write_row(context, data_ptr, data_len)) {
+        std::string errmsg;
+        errmsg.append("load data from ")
+            .append(source->s->db.str)
+            .append(".")
+            .append(source->s->table_name.str)
+            .append(" to imcs failed.");
+        my_error(ER_SECONDARY_ENGINE, MYF(0), errmsg.c_str());
         source->file->ha_rnd_end();
         return HA_ERR_GENERIC;
       }
-      key.str("");
+      key.clear();
     }
 
     m_thd->inc_sent_row_count(1);

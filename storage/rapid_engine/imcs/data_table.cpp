@@ -51,7 +51,6 @@ DataTable::DataTable(TABLE *source_table) : m_initialized{false}, m_data_source(
   ut_a(m_data_source);
 
   std::string key_part, key;
-  // key_part << m_data_source->s->db.str << ":" << m_data_source->s->table_name.str << ":";
   thread_local std::string key_buffer;
   key_buffer.reserve(256);
   for (auto index = 0u; index < m_data_source->s->fields; index++) {
@@ -145,7 +144,7 @@ start:
     auto is_deleted = cu->chunk(current_chunk)->is_deleted(m_context.get(), offset_in_chunk);
     auto is_null = cu->chunk(current_chunk)->is_null(m_context.get(), offset_in_chunk);
     if (is_deleted) {
-      auto smu = cu->chunk(current_chunk)->get_header()->m_smu.get();
+      auto smu = cu->chunk(current_chunk)->header()->m_smu.get();
       data_ptr = smu->build_prev_vers(m_context.get(), offset_in_chunk);
       if (!data_ptr && !is_null) {
         m_rowid.fetch_add(1);

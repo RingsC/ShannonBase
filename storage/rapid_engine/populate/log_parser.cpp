@@ -585,7 +585,7 @@ int LogParser::find_matched_rows(Rapid_load_context *context, std::string &key_n
       auto cu_name = to_find.first;
       if (!imcs_instance->get_cu(cu_name.c_str())) continue;  // means that was not loaded into.
 
-      auto ba = imcs_instance->get_cu(cu_name.c_str())->chunk(current_chunk_id)->get_header()->m_del_mask.get();
+      auto ba = imcs_instance->get_cu(cu_name.c_str())->chunk(current_chunk_id)->header()->m_del_mask.get();
       if (ba && Utils::Util::bit_array_get(ba, offset_in_chunk))  // deleted row, TODO:traverse all versions.
         continue;
 
@@ -603,7 +603,7 @@ int LogParser::find_matched_rows(Rapid_load_context *context, std::string &key_n
       if (to_find.second.get()) {  // not null
         matched = (memcmp(to_find.second.get(), pos, field_normal_len)) ? false : true;
       } else {  // is null, then need to check the null bitmap.
-        auto ba = imcs_instance->get_cu(cu_name.c_str())->chunk(current_chunk_id)->get_header()->m_null_mask.get();
+        auto ba = imcs_instance->get_cu(cu_name.c_str())->chunk(current_chunk_id)->header()->m_null_mask.get();
         matched = Utils::Util::bit_array_get(ba, offset_in_chunk) ? true : false;
       }
       if (!matched) break;
