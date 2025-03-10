@@ -103,6 +103,9 @@ class Chunk : public MemoryObject {
     // MVCC to decide that whether this phyical row is visiable or not to this
     // transaction.
     std::atomic<uint64> m_prows{0};
+
+    // the length of key.
+    size_t m_key_len{0};
   };
 
   explicit Chunk(const Field *field);

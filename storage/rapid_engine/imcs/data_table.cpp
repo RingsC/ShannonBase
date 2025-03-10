@@ -124,7 +124,7 @@ start:
 
   for (auto idx = 0u; idx < m_field_cus.size(); idx++) {
     auto cu = m_field_cus[idx];
-    if (cu->keystr().find(SHANNON_DB_TRX_ID) != std::string::npos) continue;  // invisible col.
+    // if (cu->keystr().find(SHANNON_DB_TRX_ID) != std::string::npos) continue;  // invisible col.
 
     auto normalized_length = cu->normalized_pack_length();
     auto is_text_value = Utils::Util::is_string(cu->header()->m_source_fld->type()) ||
@@ -136,17 +136,19 @@ start:
 
     // to check version link to check its old value.
     uchar *data_ptr{nullptr};
-    auto is_deleted = cu->chunk(current_chunk)->is_deleted(m_context.get(), offset_in_chunk);
-    auto is_null = cu->chunk(current_chunk)->is_null(m_context.get(), offset_in_chunk);
+    auto current_chunk_ptr = cu->chunk(current_chunk);
+    auto is_deleted = current_chunk_ptr->is_deleted(m_context.get(), offset_in_chunk);
+    auto is_null = current_chunk_ptr->is_null(m_context.get(), offset_in_chunk);
     if (is_deleted) {
-      auto smu = cu->chunk(current_chunk)->header()->m_smu.get();
+      auto smu = current_chunk_ptr->header()->m_smu.get();
       data_ptr = smu->build_prev_vers(m_context.get(), offset_in_chunk);
       if (!data_ptr && !is_null) {
         m_rowid.fetch_add(1);
         goto start;
       }
     } else {
-      data_ptr = cu->chunk(current_chunk)->base() + offset_in_chunk * normalized_length;
+      data_ptr =
+          current_chunk_ptr->base() + offset_in_chunk * (normalized_length + current_chunk_ptr->header()->m_key_len);
       if ((uintptr_t(data_ptr) & (CACHE_LINE_SIZE - 1)) == 0)
         SHANNON_PREFETCH_R(data_ptr + PREFETCH_AHEAD * CACHE_LINE_SIZE);
     }

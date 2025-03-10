@@ -127,6 +127,13 @@ int Imcs::load_table(const Rapid_load_context *context, const TABLE *source) {
       return HA_ERR_GENERIC;
     });
 
+    // ref to `row_sel_store_row_id_to_prebuilt` in row0sel.cc
+    source->file->position(source->record[0]);
+    auto load_context = const_cast<Rapid_load_context *>(context);
+    load_context->m_extra_info.m_key_len = source->file->ref_length;
+    load_context->m_extra_info.m_key_buff = std::make_unique<uchar[]>(source->file->ref_length);
+    memcpy(load_context->m_extra_info.m_key_buff.get(), source->file->ref, source->file->ref_length);
+
     /**
      * for VARCHAR type Data in field->ptr is stored as: 1 or 2 bytes length-prefix-header  (from
      * Field_varstring::length_bytes) data. the here we dont use var_xxx to get data, rather getting

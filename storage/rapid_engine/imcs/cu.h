@@ -80,6 +80,9 @@ class Cu : public MemoryObject {
     // statistics info.
     std::atomic<double> m_max{SHANNON_MIN_DOUBLE}, m_min{SHANNON_MAX_DOUBLE}, m_middle{0}, m_median{0}, m_avg{0},
         m_sum{0};
+
+    // key length of this cu.
+    size_t m_key_len{0};
   };
 
   explicit Cu(const Field *field);

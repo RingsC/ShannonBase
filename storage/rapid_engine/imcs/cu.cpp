@@ -53,6 +53,7 @@ Cu::Cu(const Field *field) {
     m_header->m_source_fld = field->clone(&rapid_mem_root);
     m_header->m_type = field->type();
     m_header->m_charset = field->charset();
+    m_header->m_key_len = field->table->file->ref_length;
   }
 
   std::string comment(field->comment.str);

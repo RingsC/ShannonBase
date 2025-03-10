@@ -65,6 +65,16 @@ Chunk::Chunk(const Field *field) {
   else
     m_header->m_normalized_pack_length = field->pack_length();
 
+  m_header->m_key_len = field->table->file->ref_length;
+
+  m_header->m_prows.store(0);
+  m_header->m_sum.store(0);
+  m_header->m_avg.store(0);
+  m_header->m_min.store(std::numeric_limits<double>::max());
+  m_header->m_max.store(std::numeric_limits<double>::min());
+  m_header->m_middle.store(0);
+  m_header->m_median.store(0);
+
   /** there's null values in, therefore, alloc the null bitmap, and del bit map will
    * lazy allocated.*/
   if (field->is_nullable()) {
@@ -82,7 +92,7 @@ Chunk::Chunk(const Field *field) {
     return;  // allocated faile.
   }
 
-  size_t chunk_size = SHANNON_ROWS_IN_CHUNK * m_header->m_normalized_pack_length;
+  size_t chunk_size = SHANNON_ROWS_IN_CHUNK * (m_header->m_key_len + m_header->m_normalized_pack_length);
   ut_ad(field && chunk_size < ShannonBase::rpd_mem_sz_max);
 
   /**m_data_base，here, we use the same psi key with buffer pool which used in
@@ -305,11 +315,13 @@ uchar *Chunk::read(const Rapid_load_context *context, uchar *data, size_t len) {
 
 uchar *Chunk::write(const Rapid_load_context *context, uchar *data, size_t len) {
   ut_a((!data && len == UNIV_SQL_NULL) || (data && len != UNIV_SQL_NULL));
+  assert(context->m_extra_info.m_key_len == m_header->m_key_len);
+
   check_data_type(len);
 
   auto normal_len = (len == UNIV_SQL_NULL) ? m_header->m_normalized_pack_length : len;
   auto diff = m_data.load(std::memory_order_relaxed) - m_base.load(std::memory_order_relaxed);
-  ut_a(diff % m_header->m_normalized_pack_length == 0);
+  ut_a(diff % (m_header->m_normalized_pack_length + m_header->m_key_len) == 0);
   if (unlikely((m_data.load(std::memory_order_relaxed) + normal_len) >
                m_end.load(std::memory_order_relaxed))) {  // this chunk is full.
     ut_a(diff / m_header->m_normalized_pack_length == SHANNON_ROWS_IN_CHUNK);
@@ -332,12 +344,20 @@ uchar *Chunk::write(const Rapid_load_context *context, uchar *data, size_t len) 
      * mask, then writting a placehold to chunk, we dont care about what read data
      * was written down.*/
     Utils::Util::bit_array_set(m_header->m_null_mask.get(), m_header->m_prows);
-    len = m_header->m_normalized_pack_length;
+
+    ret = static_cast<uchar *>(
+        std::memcpy(m_data.load(), context->m_extra_info.m_key_buff.get(), context->m_extra_info.m_key_len));
+    len += (context->m_extra_info.m_key_len +
+            m_header->m_normalized_pack_length);  // null, just keep a rowid, and then advance the step.
+    m_data.fetch_add(len);
   } else {
     std::scoped_lock data_guard(m_data_mutex);
+    ret = static_cast<uchar *>(
+        std::memcpy(m_data.load(), context->m_extra_info.m_key_buff.get(), context->m_extra_info.m_key_len));
+    m_data.fetch_add(context->m_extra_info.m_key_len);
     ret = static_cast<uchar *>(std::memcpy(m_data.load(), data, len));
+    m_data.fetch_add(len);
   }
-  m_data.fetch_add(len);
 
   if (context->m_extra_info.m_trxid) {  // means not from secondary_load operation.
     build_version(rowid, context->m_extra_info.m_trxid, data, len, OPER_TYPE::OPER_INSERT);
