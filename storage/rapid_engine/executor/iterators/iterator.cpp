@@ -107,8 +107,7 @@ void ColumnChunk::initialize_buffers() {
   m_cols_buffer = std::make_unique<uchar[]>(buffer_size);
   std::memset(m_cols_buffer.get(), 0, buffer_size);
 
-  size_t null_mask_size = (m_chunk_size + 7) / 8 + 1;
-  m_null_mask = std::make_unique<ShannonBase::bit_array_t>(null_mask_size);
+  m_null_mask = std::make_unique<ShannonBase::bit_array_t>(m_chunk_size);
 }
 
 void ColumnChunk::copy_from(const ColumnChunk &other) {
@@ -284,7 +283,7 @@ static int64_t get_scale_factor(uint scale) {
 /**
  * @brief Get the scale (number of decimal places) from Field
  */
-static uint get_decimal_scale(Field *field) {
+static inline uint get_decimal_scale(Field *field) {
   if (field && field->type() == MYSQL_TYPE_NEWDECIMAL) {
     // Field_new_decimal type provides decimals() information
     return field->decimals();
@@ -325,18 +324,28 @@ static bool can_use_int64_for_decimal(Field *field) {
  * @note This conversion scales the decimal value to an integer, preserving original precision
  */
 static int64_t my_decimal_to_int64(const my_decimal *dec, uint scale) {
-  // Method 1: Direct conversion using decimal2longlong (if scale = 0)
-  if (scale == 0) {
-    longlong result;
-    decimal2longlong(dec, &result);
-    return static_cast<int64_t>(result);
+  longlong base_val = 0;
+  if (decimal2longlong(dec, &base_val) == E_DEC_OK && scale == 0) {
+    // When scale = 0, direct conversion is possible
+    return static_cast<int64_t>(base_val);
   }
 
-  // Method 2: Convert to double then scale
-  double val = 0.0;
-  decimal2double(dec, &val);
+  // Otherwise, use binary conversion to avoid double precision loss
+  uchar bin_buf[DECIMAL_MAX_PRECISION];  // Sufficient to hold all decimal values
+  // int bin_size = decimal_bin_size(dec->precision(), dec->frac);
+  decimal2bin(dec, bin_buf, dec->precision(), dec->frac);
+
+  // Directly extract the integer part and scale according to the scale factor
+  int64_t result = 0;
+  my_decimal tmp;
+  bin2decimal(bin_buf, &tmp, dec->precision(), dec->frac);
+
+  longlong scaled_val = 0;
+  decimal2longlong(&tmp, &scaled_val);  // Already converted to integer
   int64_t scale_factor = get_scale_factor(scale);
-  return static_cast<int64_t>(val * scale_factor);
+
+  result = static_cast<int64_t>(scaled_val * scale_factor);
+  return result;
 }
 
 /**
@@ -346,14 +355,18 @@ static int64_t my_decimal_to_int64(const my_decimal *dec, uint scale) {
  * @param dec - output decimal value
  */
 static void int64_to_my_decimal(int64_t val, uint scale, my_decimal *dec) {
+  my_decimal tmp;
+  longlong2decimal(val, &tmp);
+
   if (scale == 0) {
-    int2my_decimal(E_DEC_FATAL_ERROR, val, false, dec);
+    *dec = tmp;
     return;
   }
 
+  // dive by scale_factor, get the original decimal.
   int64_t scale_factor = get_scale_factor(scale);
-  double dval = static_cast<double>(val) / static_cast<double>(scale_factor);
-  double2decimal(dval, dec);
+  longlong scaled_int = static_cast<longlong>(val / scale_factor);
+  longlong2decimal(scaled_int, dec);
 }
 
 /**

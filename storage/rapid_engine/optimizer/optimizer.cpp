@@ -192,7 +192,6 @@ AccessPath *OptimizeAndRewriteAccessPath(OptimizeContext *context, AccessPath *p
       }
       auto n_records = path->num_output_rows_before_filter;
       if ((size_t)n_records >= SHANNON_VECTOR_WIDTH) context->can_vectorized = true;
-
       if (path->vectorized == context->can_vectorized) return nullptr;
 
       auto rapid_path = new (current_thd->mem_root) AccessPath();
