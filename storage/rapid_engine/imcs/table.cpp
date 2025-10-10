@@ -168,7 +168,7 @@ int Table::create_fields_memo(const Rapid_load_context *context) {
 
   for (auto index = 0u; index < source->s->fields; index++) {
     auto field = *(source->field + index);
-    if (field->is_flag_set(NOT_SECONDARY_FLAG)) continue;
+    if (bitmap_is_set(source->read_set, index) || field->is_flag_set(NOT_SECONDARY_FLAG)) continue;
 
     size_t chunk_size = SHANNON_ROWS_IN_CHUNK * Utils::Util::normalized_length(field);
     if (likely(ShannonBase::rapid_allocated_mem_size + chunk_size > ShannonBase::rpd_mem_sz_max)) {
@@ -342,8 +342,29 @@ int Table::write(const Rapid_load_context *context, uchar *data) {
         case MYSQL_TYPE_MEDIUM_BLOB:
         case MYSQL_TYPE_LONG_BLOB: {
           // TODO: BLOB data maybe not in the page. stores off the page.
-          data_ptr = const_cast<uchar *>(fld->data_ptr());
-          data_len = down_cast<Field_blob *>(fld)->get_length();
+          auto bfld = down_cast<Field_blob *>(fld);
+          uint pack_len = bfld->pack_length_no_ptr();
+          switch (pack_len) {
+            case 1:
+              data_len = *data_ptr;
+              break;
+            case 2:
+              data_len = uint2korr(data_ptr);
+              break;
+            case 3:
+              data_len = uint3korr(data_ptr);
+              break;
+            case 4:
+              data_len = uint4korr(data_ptr);
+              break;
+          }
+          // Advance past length prefix
+          data_ptr += pack_len;
+
+          // For BLOBs, the data_ptr now points to a pointer to the actual blob data
+          uchar *blob_ptr = nullptr;
+          memcpy(&blob_ptr, data_ptr, sizeof(uchar *));
+          data_ptr = blob_ptr;
         } break;
         case MYSQL_TYPE_VARCHAR:
         case MYSQL_TYPE_VAR_STRING: {
@@ -406,7 +427,8 @@ int Table::write(const Rapid_load_context *context, uchar *rowdata, size_t len, 
         case MYSQL_TYPE_LONG_BLOB: {
           // TODO: BLOB data maybe not in the page. stores off the page.
           auto bfld = down_cast<Field_blob *>(fld);
-          switch (bfld->pack_length_no_ptr()) {
+          uint pack_len = bfld->pack_length_no_ptr();
+          switch (pack_len) {
             case 1:
               data_len = *data_ptr;
               break;
@@ -420,6 +442,13 @@ int Table::write(const Rapid_load_context *context, uchar *rowdata, size_t len, 
               data_len = uint4korr(data_ptr);
               break;
           }
+          // Advance past length prefix
+          data_ptr += pack_len;
+
+          // For BLOBs, the data_ptr now points to a pointer to the actual blob data
+          uchar *blob_ptr = nullptr;
+          memcpy(&blob_ptr, data_ptr, sizeof(uchar *));
+          data_ptr = blob_ptr;
         } break;
         case MYSQL_TYPE_VARCHAR:
         case MYSQL_TYPE_VAR_STRING: {
@@ -648,7 +677,7 @@ int PartTable::build_index_impl(const Rapid_load_context *context, const KEY *ke
   // why we dont not change the impl of postion() directly? because the postion() is impled in innodb engine.
   // we want to decouple with innodb engine.
   auto source = context->m_table;
-  auto active_partkey = context->m_extra_info.m_active_part_key;
+  auto active_partkey = Rapid_load_context::extra_info_t::m_active_part_key;
 
   if (key == nullptr) {
     /* No primary key was defined for the table and we generated the clustered index
@@ -692,7 +721,7 @@ int PartTable::build_index_impl(const Rapid_load_context *context, const KEY *ke
   // why we dont not change the impl of postion() directly? because the postion() is impled in innodb engine.
   // we want to decouple with innodb engine.
   auto source = context->m_table;
-  auto active_partkey = context->m_extra_info.m_active_part_key;
+  auto active_partkey = Rapid_load_context::extra_info_t::m_active_part_key;
 
   std::unique_ptr<uchar[]> key_buff{nullptr};
   auto key_len{0u};
@@ -774,7 +803,7 @@ int PartTable::write(const Rapid_load_context *context, uchar *data) {
       }
     }
 
-    auto active_part = context->m_extra_info.m_active_part_key;
+    auto active_part = Rapid_load_context::extra_info_t::m_active_part_key;
     auto key = active_part.append(":").append(fld->field_name);
     if (!(m_fields[key]->write_row(context, rowid, data_ptr, data_len))) {
       // TODO: mark this row to be junk.
@@ -817,7 +846,8 @@ int PartTable::write(const Rapid_load_context *context, uchar *rowdata, size_t l
         case MYSQL_TYPE_MEDIUM_BLOB:
         case MYSQL_TYPE_LONG_BLOB: {
           auto bfld = down_cast<Field_blob *>(fld);
-          switch (bfld->pack_length_no_ptr()) {
+          uint pack_len = bfld->pack_length_no_ptr();
+          switch (pack_len) {
             case 1:
               data_len = *data_ptr;
               break;
@@ -831,6 +861,13 @@ int PartTable::write(const Rapid_load_context *context, uchar *rowdata, size_t l
               data_len = uint4korr(data_ptr);
               break;
           }
+          // Advance past length prefix
+          data_ptr += pack_len;
+
+          // For BLOBs, the data_ptr now points to a pointer to the actual blob data
+          uchar *blob_ptr = nullptr;
+          memcpy(&blob_ptr, data_ptr, sizeof(uchar *));
+          data_ptr = blob_ptr;
         } break;
         case MYSQL_TYPE_VARCHAR:
         case MYSQL_TYPE_VAR_STRING: {
@@ -847,7 +884,8 @@ int PartTable::write(const Rapid_load_context *context, uchar *rowdata, size_t l
       }
     }
 
-    if (!(m_fields[fld->field_name]->write_row(context, rowid, data_ptr, data_len))) {
+    auto active_key = Rapid_load_context::extra_info_t::m_active_part_key + ":" + fld->field_name;
+    if (!(m_fields[active_key]->write_row(context, rowid, data_ptr, data_len))) {
       // TODO: mark this row to be junk.
       return HA_ERR_GENERIC;
     }

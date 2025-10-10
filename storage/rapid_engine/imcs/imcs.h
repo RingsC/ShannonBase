@@ -159,6 +159,7 @@ class Imcs : public MemoryObject {
   int load_innodb(const Rapid_load_context *context, ha_innobase *file);
   int load_innodb_parallel(const Rapid_load_context *context, ha_innobase *file);
   int load_innodbpart(const Rapid_load_context *context, ha_innopart *file);
+  int load_innodbpart_parallel(const Rapid_load_context *context, ha_innopart *file);
 
   int unload_innodb(const Rapid_load_context *context, const char *db_name, const char *table_name,
                     bool error_if_not_loaded);
@@ -167,6 +168,7 @@ class Imcs : public MemoryObject {
                         bool error_if_not_loaded);
 
  private:
+  // Thread context for parallel scanning operations
   typedef struct {
     // if you dont use this, remove the boost_thread and boost_system libs in cmake file.
     // thread id
@@ -184,6 +186,16 @@ class Imcs : public MemoryObject {
     std::vector<ulong> null_byte_offsets;
     std::vector<ulong> null_bitmasks;
   } parall_scan_cookie_t;
+
+  // a partition loading task with results
+  typedef struct PartitionLoadTask {
+    uint part_id;
+    std::string part_key;
+    int result;
+    uint64_t rows_loaded;
+    std::string error_msg;
+    PartitionLoadTask() : part_id(0), result(0), rows_loaded(0) {}
+  } partition_load_task_t;
 
   // imcs instance
   static Imcs *m_instance;
@@ -208,6 +220,75 @@ class Imcs : public MemoryObject {
 
   const char *m_magic = "SHANNON_MAGIC_IMCS";
 };
+
+// Manages THD lifecycle, table opening, and handler cloning.
+// Ensures THD globals are restored properly on destruction, preventing
+// thread-local state corruption in multi-threaded parallel loading
+class PartitionLoadThreadContext {
+ public:
+  PartitionLoadThreadContext() : m_thd(nullptr), m_handler(nullptr), m_table(nullptr) { my_thread_init(); }
+
+  ~PartitionLoadThreadContext() {
+    cleanup();
+    my_thread_end();
+  }
+
+  bool initialize(const Rapid_load_context *context);
+  bool clone_handler(ha_innopart *file, const Rapid_load_context *context, std::mutex &clone_mutex);
+
+  inline THD *thd() { return m_thd; }
+  inline ha_innopart *handler() { return m_handler; }
+  inline TABLE *table() { return m_table; }
+
+  // Prevent copying
+  PartitionLoadThreadContext(const PartitionLoadThreadContext &) = delete;
+  PartitionLoadThreadContext &operator=(const PartitionLoadThreadContext &) = delete;
+
+ private:
+  void cleanup() {
+    // Handler cleanup is automatic through THD's mem_root
+    // Just restore globals if needed
+    if (m_thd) {
+      m_thd->restore_globals();
+      //delete m_thd;
+      // THD is allocated through new, but cleanup is handled by MySQL internals
+    }
+  }
+
+  THD *m_thd;
+  ha_innopart *m_handler;
+  TABLE *m_table;
+};
+
+// Manages InnoDB transaction state by acquiring/releasing external locks.
+// 1. ha_external_lock(F_RDLCK) starts the transaction before reading data
+// 2. ha_external_lock(F_UNLCK) releases the lock on destruction
+class PartitionLoadHandlerLock {
+ public:
+  PartitionLoadHandlerLock(handler *h, THD *thd, int lock_type) : m_handler(h), m_thd(thd), m_locked(false) {
+    if (m_handler && m_handler->ha_external_lock(m_thd, lock_type) == 0) {
+      m_locked = true;
+    }
+  }
+
+  virtual ~PartitionLoadHandlerLock() {
+    if (m_locked && m_handler) {
+      m_handler->ha_external_lock(m_thd, F_UNLCK);
+    }
+  }
+
+  inline bool is_locked() const { return m_locked; }
+
+  // Prevent copying
+  PartitionLoadHandlerLock(const PartitionLoadHandlerLock &) = delete;
+  PartitionLoadHandlerLock &operator=(const PartitionLoadHandlerLock &) = delete;
+
+ private:
+  handler *m_handler;
+  THD *m_thd;
+  bool m_locked;
+};
+
 }  // namespace Imcs
 }  // namespace ShannonBase
 #endif  //__SHANNONBASE_IMCS_H__

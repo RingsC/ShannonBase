@@ -30,14 +30,18 @@
 
 #include <threads.h>
 #include <condition_variable>
-#include <mutex>
+#include <future>
 #include <sstream>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "include/decimal.h"
-#include "include/my_dbug.h"                     //DBUG_EXECUTE_IF
-#include "include/row0pread-adapter.h"           //Parallel Reader
+#include "include/my_dbug.h"            //DBUG_EXECUTE_IF
+#include "include/row0pread-adapter.h"  //Parallel Reader
+#include "sql/dd_table_share.h"
 #include "sql/partitioning/partition_handler.h"  //partition handler
+#include "sql/sql_base.h"
 
 #include "storage/innobase/handler/ha_innopart.h"
 #include "storage/innobase/include/data0type.h"
@@ -52,12 +56,58 @@
 
 namespace ShannonBase {
 extern ulonglong rpd_para_load_threshold;
+SHANNON_THREAD_LOCAL std::string Rapid_load_context::extra_info_t::m_active_part_key;
 namespace Imcs {
 Imcs *Imcs::m_instance{nullptr};
 std::unique_ptr<boost::asio::thread_pool> Imcs::m_imcs_pool{nullptr};
 std::once_flag Imcs::one;
 
 SHANNON_THREAD_LOCAL Imcs *current_imcs_instance = Imcs::instance();
+
+bool PartitionLoadThreadContext::initialize(const Rapid_load_context *context) {
+  // Create THD
+  m_thd = new THD;
+  if (!m_thd) return true;
+
+  m_thd->set_new_thread_id();
+  m_thd->thread_stack = (char *)this;
+  m_thd->set_command(COM_DAEMON);
+  m_thd->security_context()->skip_grants();
+  m_thd->system_thread = NON_SYSTEM_THREAD;
+  m_thd->store_globals();
+  m_thd->lex->sql_command = SQLCOM_SELECT;
+
+  // Open table from share
+  TABLE_SHARE *share = context->m_table->s;
+  m_table = (TABLE *)m_thd->mem_root->Alloc(sizeof(TABLE));
+  if (!m_table) return true;
+
+  if (open_table_from_share(m_thd, share, share->path.str, 0, SKIP_NEW_HANDLER, 0, m_table, false, nullptr)) {
+    return true;
+  }
+
+  m_table->in_use = m_thd;
+  m_table->alias_name_used = context->m_table->alias_name_used;
+  m_table->read_set = context->m_table->read_set;
+  m_table->write_set = context->m_table->write_set;
+
+  return false;
+}
+
+bool PartitionLoadThreadContext::clone_handler(ha_innopart *file, const Rapid_load_context *context,
+                                               std::mutex &clone_mutex) {
+  std::lock_guard<std::mutex> lock(clone_mutex);
+  THD *original_thd = context->m_table->in_use;
+  context->m_table->in_use = m_thd;
+  m_handler = static_cast<ha_innopart *>(file->clone(context->m_table->s->normalized_path.str, m_thd->mem_root));
+  context->m_table->in_use = original_thd;
+
+  if (!m_handler) return true;
+
+  m_handler->change_table_ptr(m_table, m_table->s);
+  m_table->file = m_handler;
+  return false;
+}
 
 int Imcs::initialize() {
   if (!m_inited.load()) {
@@ -382,7 +432,7 @@ int Imcs::load_innodbpart(const Rapid_load_context *context, ha_innopart *file) 
   for (auto &part : context->m_extra_info.m_partition_infos) {
     auto partkey(part.first);
     partkey.append("#").append(std::to_string(part.second));
-    const_cast<Rapid_load_context *>(context)->m_extra_info.m_active_part_key = partkey;
+    Rapid_load_context::extra_info_t::m_active_part_key = partkey;
     // should be RC isolation level. set_tx_isolation(m_thd, ISO_READ_COMMITTED, true);
     if (file->inited == handler::NONE && file->rnd_init_in_part(part.second, true)) {
       my_error(ER_NO_SUCH_TABLE, MYF(0), sch_name, table_name);
@@ -416,6 +466,165 @@ int Imcs::load_innodbpart(const Rapid_load_context *context, ha_innopart *file) 
     file->rnd_end_in_part(part.second, true);
   }
 
+  return ShannonBase::SHANNON_SUCCESS;
+}
+
+int Imcs::load_innodbpart_parallel(const Rapid_load_context *context, ha_innopart *file) {
+  std::string sch_name(context->m_schema_name.c_str());
+  std::string table_name(context->m_table_name.c_str());
+  std::string key;
+  key.append(sch_name).append(":").append(table_name);
+
+  ut_a(m_parttables.find(key) != m_parttables.end());
+  context->m_thd->set_sent_row_count(0);
+
+  unsigned int num_threads = std::thread::hardware_concurrency() * 0.8;
+  if (num_threads == 0) num_threads = SHANNON_PARTS_PARALLEL;
+
+  std::vector<partition_load_task_t> tasks;
+  tasks.reserve(context->m_extra_info.m_partition_infos.size());
+
+  for (auto &part : context->m_extra_info.m_partition_infos) {
+    partition_load_task_t task;
+    task.part_id = part.second;
+    task.part_key = part.first + "#" + std::to_string(part.second);
+    task.result = ShannonBase::SHANNON_SUCCESS;
+    task.rows_loaded = 0;
+    tasks.push_back(std::move(task));
+  }
+
+  num_threads = std::min(num_threads, static_cast<unsigned int>(tasks.size()));
+
+  std::mutex error_mutex, clone_mutex;
+  std::atomic<uint64_t> total_rows{0};
+  std::atomic<bool> has_error{false};
+
+  std::vector<ulong> col_offsets(context->m_table->s->fields);
+  std::vector<ulong> null_byte_offsets(context->m_table->s->fields);
+  std::vector<ulong> null_bitmasks(context->m_table->s->fields);
+
+  for (uint idx = 0; idx < context->m_table->s->fields; idx++) {
+    auto fld = *(context->m_table->field + idx);
+    col_offsets[idx] = fld->offset(context->m_table->record[0]);
+    null_byte_offsets[idx] = fld->null_offset();
+    null_bitmasks[idx] = fld->null_bit;
+  }
+
+  auto load_one_partition = [&](partition_load_task_t &task,
+                                ha_innopart *task_handler) -> int {  // Lambda: load a partition.
+    int result{ShannonBase::SHANNON_SUCCESS};
+    task.rows_loaded = 0;
+
+    if (task_handler == nullptr) {
+      std::lock_guard<std::mutex> lock(error_mutex);
+      task.error_msg = "Handler clone is null for partition " + std::to_string(task.part_id);
+      task.result = HA_ERR_GENERIC;
+      return HA_ERR_GENERIC;
+    }
+
+    Rapid_load_context::extra_info_t::m_active_part_key = task.part_key;
+
+    bool part_initialized = false;
+    struct PartitionGuard {  // Scope guard using local struct - will be called at scope exit
+      bool &initialized;
+      ha_innopart *handler;
+      uint part_id;
+
+      ~PartitionGuard() {
+        if (initialized && handler) {
+          handler->rnd_end_in_part(part_id, true);
+        }
+      }
+    } part_guard{part_initialized, task_handler, task.part_id};
+
+    if (task_handler->inited == handler::NONE && task_handler->rnd_init_in_part(task.part_id, true)) {
+      std::lock_guard<std::mutex> lock(error_mutex);
+      task.error_msg = "Failed to initialize partition " + std::to_string(task.part_id);
+      task.result = HA_ERR_GENERIC;
+      return HA_ERR_GENERIC;
+    }
+    part_initialized = true;
+
+    int tmp{HA_ERR_GENERIC};
+    std::unique_ptr<uchar[]> rec_buff = std::make_unique<uchar[]>(context->m_table->s->rec_buff_length);
+    memset(rec_buff.get(), 0, context->m_table->s->rec_buff_length);
+    while ((tmp = task_handler->rnd_next_in_part(task.part_id, rec_buff.get())) != HA_ERR_END_OF_FILE) {
+      if (tmp == HA_ERR_KEY_NOT_FOUND) break;
+
+      DBUG_EXECUTE_IF("secondary_engine_rapid_part_table_load_error", {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        task.error_msg = "Secondary engine part table loaded error";
+        task.result = HA_ERR_GENERIC;
+        return HA_ERR_GENERIC;
+      });
+
+      auto it = m_parttables.find(key);
+      if (it == m_parttables.end()) {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        task.error_msg = "parttable not found: " + key;
+        task.result = HA_ERR_GENERIC;
+        return HA_ERR_GENERIC;
+      }
+      auto &parttable = it->second;  // parttable is shared_ptr/unique_ptr to PartTable
+      if (parttable->write(context, rec_buff.get(), context->m_table->s->reclength, col_offsets.data(),
+                           context->m_table->s->fields, null_byte_offsets.data(), null_bitmasks.data())) {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        task.error_msg = "load data from " + sch_name + "." + table_name + " to imcs failed";
+        task.result = HA_ERR_GENERIC;
+        return HA_ERR_GENERIC;
+      }
+
+      memset(rec_buff.get(), 0, context->m_table->s->rec_buff_length);
+      task.rows_loaded++;
+      if (tmp == HA_ERR_RECORD_DELETED && !context->m_thd->killed) continue;
+    }
+
+    task.result = ShannonBase::SHANNON_SUCCESS;
+    return result;
+  };
+
+  std::atomic_size_t task_idx{0};
+  std::vector<std::thread> workers_pool;  // thread pool.
+  auto worker_func = [&]() {
+    PartitionLoadThreadContext ctx;
+    std::unique_ptr<PartitionLoadHandlerLock> handler_lock{nullptr};
+    if (ctx.initialize(context) || ctx.clone_handler(file, context, clone_mutex)) {
+      has_error.store(true);
+      return;
+    }
+    handler_lock = std::make_unique<PartitionLoadHandlerLock>(ctx.handler(), ctx.thd(), F_RDLCK);
+
+    while (true) {
+      size_t current_task = task_idx.fetch_add(1);
+      if (current_task >= tasks.size() || has_error.load()) break;
+
+      auto result = load_one_partition(tasks[current_task], ctx.handler());
+      if (result != ShannonBase::SHANNON_SUCCESS) {
+        has_error.store(true);
+        break;
+      }
+      total_rows.fetch_add(tasks[current_task].rows_loaded);
+    }
+  };
+
+  for (unsigned int i = 0; i < 1 /*num_threads*/; ++i) {  // to start the worker threads.
+    workers_pool.emplace_back(worker_func);
+  }
+
+  for (auto &worker : workers_pool) {
+    if (worker.joinable()) worker.join();
+  }
+
+  if (has_error.load()) {
+    for (const auto &task : tasks) {
+      if (task.result == ShannonBase::SHANNON_SUCCESS) continue;
+      task.error_msg.size() ? my_error(ER_SECONDARY_ENGINE, MYF(0), task.error_msg.c_str())
+                            : my_error(ER_NO_SUCH_TABLE, MYF(0), sch_name.c_str(), table_name.c_str());
+      return HA_ERR_GENERIC;
+    }
+  }
+
+  context->m_thd->set_sent_row_count(total_rows.load());
   return ShannonBase::SHANNON_SUCCESS;
 }
 
@@ -456,10 +665,20 @@ int Imcs::load_parttable(const Rapid_load_context *context, const TABLE *source)
   }
 
   auto ret{ShannonBase::SHANNON_SUCCESS};
-  if ((ret = load_innodbpart(context, dynamic_cast<ha_innopart *>(source->file)))) {
-    // if load partition table failed, then do normal load mode, therefore clear partition info.
-    const_cast<Rapid_load_context *>(context)->m_extra_info.m_partition_infos.clear();
-    ret = load_innodb(context, dynamic_cast<ha_innobase *>(source->file));
+  auto parall_scan = (context->m_extra_info.m_partition_infos.size() > SHANNON_PARTS_PARALLEL) ? true : false;
+  ret = parall_scan ? load_innodbpart_parallel(context, dynamic_cast<ha_innopart *>(source->file))
+                    : load_innodbpart(context, dynamic_cast<ha_innopart *>(source->file));
+
+  if (ret) {
+    std::string sch(source->s->db.str), table(source->s->table_name.str), errmsg;
+    cleanup(sch, table);
+    errmsg.append("load data from")
+        .append(context->m_schema_name)
+        .append(".")
+        .append(context->m_table_name)
+        .append(" failed.");
+    my_error(ER_SECONDARY_ENGINE, MYF(0), errmsg.c_str());
+    return HA_ERR_GENERIC;
   }
   return ret;
 }

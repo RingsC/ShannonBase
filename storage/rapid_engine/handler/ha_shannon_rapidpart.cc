@@ -138,7 +138,7 @@ int ha_rapidpart::load_table(const TABLE &table, bool *skip_metadata_update) {
 
   for (auto idx = 0u; idx < table.s->fields; idx++) {
     auto fld = *(table.field + idx);
-    if (fld->is_flag_set(NOT_SECONDARY_FLAG)) continue;
+    if (!bitmap_is_set(table.read_set, idx) || fld->is_flag_set(NOT_SECONDARY_FLAG)) continue;
 
     if (!ShannonBase::Utils::Util::is_support_type(fld->type())) {
       std::string err;
