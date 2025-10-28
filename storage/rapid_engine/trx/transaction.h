@@ -25,10 +25,13 @@
 */
 #ifndef __SHANNONBASE_TRANSACTION_H__
 #define __SHANNONBASE_TRANSACTION_H__
-
+#include <chrono>
+#include <shared_mutex>
 #include "sql/current_thd.h"
-#include "storage/rapid_engine/include/rapid_object.h"
 
+#include "storage/rapid_engine/include/rapid_const.h"
+#include "storage/rapid_engine/include/rapid_object.h"
+#include "storage/rapid_engine/utils/utils.h"
 class THD;
 class trx_t;
 class ReadView;
@@ -47,6 +50,7 @@ class Transaction : public MemoryObject {
 
   // here, we use innodb's trx_id_t as ours. the defined in innodb is: typedef ib_id_t trx_id_t;
   using ID = uint64_t;
+  static constexpr ID MAX_ID = std::numeric_limits<uint64_t>::max();
   // same order with trx_t::isolation_level_t::
   enum class ISOLATION_LEVEL : uint8 { READ_UNCOMMITTED, READ_COMMITTED, READ_REPEATABLE, SERIALIZABLE };
   enum class STATUS : uint8 { NOT_START, ACTIVE, PREPARED, COMMITTED_IN_MEMORY };
@@ -110,6 +114,8 @@ class Transaction : public MemoryObject {
   trx_t *m_trx_impl{nullptr};
 
   ISOLATION_LEVEL m_iso_level{ISOLATION_LEVEL::READ_REPEATABLE};
+
+  bool m_stmt_active{false};
 };
 
 class TransactionGuard {
@@ -127,6 +133,195 @@ class TransactionGuard {
   Transaction *m_trx;
 };
 
-}  // namespace ShannonBase
+class TransactionJournal {
+ public:
+  // Status Enum
+  enum Entry_Status {
+    ACTIVE = 0,     // Active (uncommitted)
+    COMMITTED = 1,  // Committed
+    ABORTED = 2     // Rolled back
+  };
 
+  TransactionJournal(size_t capacity) : m_capacity(capacity) {}
+
+  virtual ~TransactionJournal() { clear(); }
+
+  TransactionJournal(TransactionJournal &&other) noexcept
+      : m_capacity(other.m_capacity),
+        m_entry_count(other.m_entry_count.load()),
+        m_total_size(other.m_total_size.load()) {
+    std::unique_lock lock1(m_mutex, std::defer_lock);
+    std::unique_lock lock2(other.m_mutex, std::defer_lock);
+    std::lock(lock1, lock2);
+
+    m_entries = std::move(other.m_entries);
+    m_txn_entries = std::move(other.m_txn_entries);
+    m_active_txns = std::move(other.m_active_txns);
+
+    other.m_entry_count.store(0);
+    other.m_total_size.store(0);
+  }
+
+  TransactionJournal &operator=(TransactionJournal &&other) noexcept {
+    if (this != &other) {
+      std::unique_lock lock1(m_mutex, std::defer_lock);
+      std::unique_lock lock2(other.m_mutex, std::defer_lock);
+      std::lock(lock1, lock2);
+
+      m_capacity = other.m_capacity;
+      m_entries = std::move(other.m_entries);
+      m_txn_entries = std::move(other.m_txn_entries);
+      m_active_txns = std::move(other.m_active_txns);
+
+      m_entry_count.store(other.m_entry_count.load());
+      m_total_size.store(other.m_total_size.load());
+
+      other.m_entry_count.store(0);
+      other.m_total_size.store(0);
+    }
+    return *this;
+  }
+
+  TransactionJournal(const TransactionJournal &) = delete;
+  TransactionJournal &operator=(const TransactionJournal &) = delete;
+
+  // Log Entry
+  struct Entry {
+    // Basic Information
+    row_id_t row_id : 20;   // Local row ID (supports 1M rows)
+    uint8_t operation : 2;  // INSERT/UPDATE/DELETE
+    uint8_t status : 2;     // ACTIVE/COMMITTED/ABORTED
+    uint32_t reserved : 8;
+
+    // Transaction Information
+    Transaction::ID txn_id;                           // Transaction ID
+    uint64_t scn;                                     // System Change Number (assigned at commit)
+    std::chrono::system_clock::time_point timestamp;  // Timestamp
+
+    // UPDATE Specific
+    // Bitmap marking modified columns (256 columns, 32 bytes)
+    std::bitset<MAX_COLUMNS> modified_columns;
+
+    // Linked List Pointer
+    Entry *prev;  // Points to previous version of the same row
+
+    Entry() : row_id(0), operation(0), status(0), reserved(0), txn_id(0), scn(0), prev(nullptr) {}
+
+    ~Entry() = default;
+  };
+
+  // Log Operations
+  /**
+   * Add log entry
+   * @param entry: Log entry (move semantics)
+   */
+  void add_entry(Entry &&entry);
+
+  /**
+   * Commit transaction
+   * @param txn_id: Transaction ID
+   * @param commit_scn: Commit SCN
+   */
+  void commit_transaction(Transaction::ID txn_id, uint64_t commit_scn);
+
+  /**
+   * Abort transaction
+   * @param txn_id: Transaction ID
+   */
+  void abort_transaction(Transaction::ID txn_id);
+
+  // Visibility Checking
+  /**
+   * Check if row is visible to reader
+   * @param row_id: Local row ID
+   * @param reader_txn_id: Reader transaction ID
+   * @param reader_scn: Reader snapshot SCN
+   * @return: Returns true if visible
+   */
+  bool is_row_visible(row_id_t row_id, Transaction::ID reader_txn_id, uint64_t reader_scn) const;
+
+  /**
+   * Batch visibility check (vectorized)
+   * @param start_row: Starting row
+   * @param count: Number of rows
+   * @param reader_txn_id: Reader transaction ID
+   * @param reader_scn: Reader SCN
+   * @param visibility_mask: Output bitmap (1 indicates visible)
+   */
+  void check_visibility_batch(row_id_t start_row, size_t count, Transaction::ID reader_txn_id, uint64_t reader_scn,
+                              bit_array_t &visibility_mask) const;
+
+  /**
+   * Get row state at specified SCN
+   * @param row_id: Local row ID
+   * @param target_scn: Target SCN
+   * @param modified_columns: Output modified columns (UPDATE operation)
+   * @return: Operation type
+   */
+  ShannonBase::OPER_TYPE get_row_state_at_scn(row_id_t row_id, uint64_t target_scn,
+                                              std::bitset<MAX_COLUMNS> *modified_columns = nullptr) const;
+
+  /**
+   * Clean up old versions
+   * @param min_active_scn: Minimum active SCN (versions before this SCN can be cleaned)
+   * @return: Number of entries cleaned
+   */
+  size_t purge(uint64_t min_active_scn);
+
+  /**
+   * Clean up aborted transactions
+   */
+  size_t purge_aborted();
+
+  /**
+   * Clear all logs
+   */
+  inline void clear() {
+    std::unique_lock lock(m_mutex);
+
+    m_entries.clear();
+    m_txn_entries.clear();
+    m_active_txns.clear();
+
+    m_entry_count.store(0);
+    m_total_size.store(0);
+  }
+
+  inline size_t get_entry_count() const { return m_entry_count.load(); }
+
+  inline size_t get_total_size() const { return m_total_size.load(); }
+
+  inline size_t get_active_txn_count() const {
+    std::shared_lock lock(m_mutex);
+    return m_active_txns.size();
+  }
+
+  /**
+   * Print log content (for debugging)
+   */
+  void dump(std::ostream &out) const;
+
+ private:
+  // Configuration
+  size_t m_capacity;  // IMCU capacity
+
+  // Log entries indexed by row
+  // key: local_row_id, value: version chain head (newest -> oldest)
+  std::unordered_map<row_id_t, std::unique_ptr<Entry>> m_entries;
+
+  // Indexed by transaction ID (for rollback)
+  std::unordered_map<Transaction::ID, std::vector<Entry *>> m_txn_entries;
+
+  // Active transaction set
+  std::unordered_set<Transaction::ID> m_active_txns;
+
+  // Concurrency Control
+  mutable std::shared_mutex m_mutex;
+
+  // Statistics
+  std::atomic<size_t> m_entry_count{0};
+  std::atomic<size_t> m_total_size{0};
+};
+
+}  // namespace ShannonBase
 #endif  //__SHANNONBASE_TRANSACTION_H__

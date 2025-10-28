@@ -121,6 +121,8 @@ class Rapid_context : public Secondary_engine_execution_context {
     // trxid of this innodb rows.
     Transaction::ID m_trxid{0};
 
+    Transaction::ID m_scn{0};
+
     Compress::Encoding_type m_algo{Compress::Encoding_type::SORTED};
 
     // index scan info.
@@ -172,6 +174,8 @@ class Rapid_load_context : public Rapid_context {
 
 class Rapid_scan_context : public Rapid_context {
  public:
+  size_t limit{SIZE_MAX}, rows_returned;
+  uint64_t reader_scn;
   // current transaction.
   Transaction *m_trx{nullptr};
 

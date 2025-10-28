@@ -200,7 +200,6 @@ int ha_rapid::open(const char *name, int, uint open_flags, const dd::Table *tabl
   }
   m_data_table->open();
   if (end_range) m_data_table->set_end_range(end_range);
-
   return ShannonBase::SHANNON_SUCCESS;
 }
 
@@ -347,12 +346,19 @@ int ha_rapid::load_table(const TABLE &table_arg, bool *skip_metadata_update [[ma
   context.m_extra_info.m_keynr = active_index;
   context.m_extra_info.m_key_len = table_arg.file->ref_length;
 
+  context.m_trx = Transaction::get_or_create_trx(current_thd);
+  context.m_trx->begin_stmt();
+  context.m_extra_info.m_trxid = context.m_trx->get_id();
+  context.m_extra_info.m_scn = context.m_extra_info.m_trxid;
+
   if (Imcs::Imcs::instance()->load_table(&context, const_cast<TABLE *>(&table_arg))) {
     std::string err;
     err.append(table_arg.s->db.str).append(".").append(table_arg.s->table_name.str).append(" load failed.");
     my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), err.c_str());
+    context.m_trx->rollback_stmt();
     return HA_ERR_GENERIC;
   }
+  context.m_trx->commit();
 
   m_share = new RapidShare(table_arg);
   m_share->file = this;
@@ -859,7 +865,7 @@ void NotifyAfterInsert(THD *thd, void *args) {
 
   std::string sch_tb_name = table->s->db.str;
   sch_tb_name.append(":").append(table->s->table_name.str);
-  auto rpd_table = ShannonBase::Imcs::Imcs::instance()->get_table(sch_tb_name);
+  auto rpd_table = ShannonBase::Imcs::Imcs::instance()->get_rpd_table(sch_tb_name);
   if (ShannonBase::Populate::Populator::active() && rpd_table) {
     ShannonBase::Populate::change_record_buff_t copy_info_rec(ShannonBase::Populate::Source::COPY_INFO,
                                                               table->s->rec_buff_length);
@@ -894,7 +900,7 @@ void NotifyAfterUpdate(THD *thd, void *args) {
 
   std::string sch_tb_name = table->s->db.str;
   sch_tb_name.append(":").append(table->s->table_name.str);
-  auto rpd_table = ShannonBase::Imcs::Imcs::instance()->get_table(sch_tb_name);
+  auto rpd_table = ShannonBase::Imcs::Imcs::instance()->get_rpd_table(sch_tb_name);
   if (ShannonBase::Populate::Populator::active() && rpd_table) {
     ShannonBase::Populate::change_record_buff_t copy_info_rec(ShannonBase::Populate::Source::COPY_INFO,
                                                               table->s->rec_buff_length);
@@ -927,7 +933,7 @@ void NotifyAfterDelete(THD *thd, void *args) {
 
   std::string sch_tb_name = table->s->db.str;
   sch_tb_name.append(":").append(table->s->table_name.str);
-  auto rpd_table = ShannonBase::Imcs::Imcs::instance()->get_table(sch_tb_name);
+  auto rpd_table = ShannonBase::Imcs::Imcs::instance()->get_rpd_table(sch_tb_name);
   if (ShannonBase::Populate::Populator::active() && rpd_table) {
     ShannonBase::Populate::change_record_buff_t copy_info_rec(ShannonBase::Populate::Source::COPY_INFO,
                                                               table->s->rec_buff_length);

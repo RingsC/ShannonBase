@@ -57,10 +57,14 @@ SET(SHANNON_IMCS_SOURCES
    imcs/imcu.cpp
    imcs/cu.cpp
    imcs/chunk.cpp
+   imcs/predicate.cpp
+   imcs/var_len_data.cpp
+   imcs/worker.cpp
    imcs/index/art/art.cpp
    imcs/index/encoder.cpp
    utils/utils.cpp
    utils/SIMD.cpp
+   utils/memory_pool.cpp
    imcs/purge/purge.cpp
    autopilot/loader.cpp
 )

@@ -39,6 +39,7 @@ namespace Compress {
 
 enum class Encoding_type { NONE, SORTED, VARLEN };
 enum class compress_algos { DEFAULT = 0, NONE, ZLIB, ZSTD, LZ4 };
+enum class Compression_level { DEFAULT = 0, NONE, ZLIB, ZSTD, LZ4 };
 
 class Compress_algorithm {
  public:

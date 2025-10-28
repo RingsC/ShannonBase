@@ -61,7 +61,7 @@ mysql_pfs_key_t rapid_populate_thread_key;
 namespace ShannonBase {
 namespace Populate {
 // to identify synchonization mode.
-std::atomic<SyncMode> g_sync_mode{SyncMode::REDO_LOG_PARSE};
+std::atomic<SyncMode> g_sync_mode{SyncMode::DIRECT_NOTIFICATION};
 
 // should be pay more attention to syc relation between this thread
 // and log_buffer write. if we stop changes poping, should stop writing

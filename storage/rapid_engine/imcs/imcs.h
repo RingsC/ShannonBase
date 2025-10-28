@@ -41,6 +41,7 @@
 #include "storage/rapid_engine/compress/dictionary/dictionary.h"
 #include "storage/rapid_engine/imcs/cu.h"
 #include "storage/rapid_engine/imcs/table.h"
+#include "storage/rapid_engine/imcs/table_meta.h"
 #include "storage/rapid_engine/include/rapid_const.h"
 #include "storage/rapid_engine/include/rapid_object.h"
 #include "storage/rapid_engine/utils/concurrent.h"
@@ -140,6 +141,14 @@ class Imcs : public MemoryObject {
       return m_tables[sch_table].get();
   }
 
+  inline RpdTable *get_rpd_table(std::string &sch_table) {
+    std::shared_lock lk(m_table_mutex);
+    if (m_rpd_tables.find(sch_table) == m_rpd_tables.end())
+      return nullptr;
+    else
+      return m_rpd_tables[sch_table].get();
+  }
+
   inline std::unordered_map<std::string, std::unique_ptr<RapidTable>> &get_tables() {
     std::shared_lock lk(m_table_mutex);
     return m_tables;
@@ -214,6 +223,8 @@ class Imcs : public MemoryObject {
   std::shared_mutex m_table_mutex;
   // loaded tables. key format: schema_name + ":" + table_name.
   std::unordered_map<std::string, std::unique_ptr<RapidTable>> m_tables;
+
+  std::unordered_map<std::string, std::unique_ptr<RpdTable>> m_rpd_tables;
 
   // loaded partitioned tables. key format: schema_name + ":" + table_name.
   std::unordered_map<std::string, std::unique_ptr<RapidTable>> m_parttables;

@@ -177,6 +177,7 @@ int Imcs::deinitialize() {
     m_tables.clear();  // unique_ptr will handle deletion
     m_parttables.clear();
 
+    m_rpd_tables.clear();
     m_inited.store(0);
   }
   return ShannonBase::SHANNON_SUCCESS;
@@ -185,22 +186,19 @@ int Imcs::deinitialize() {
 int Imcs::create_table_memo(const Rapid_load_context *context, const TABLE *source) {
   ut_a(source);
   auto ret{ShannonBase::SHANNON_SUCCESS};
-  std::unique_ptr<RapidTable> table{nullptr};
-  table = std::make_unique<Table>(source->s->db.str, source->s->table_name.str);
+  TableConfig table_cfg;
+  std::unique_ptr<RpdTable> rpd_table = std::make_unique<Normal_Table>(source, table_cfg);
 
-  // step 1: build the Cus meta info for every column.
-  if ((ret = table.get()->create_fields_memo(context))) return ret;
+  // step 1: create index memo of this table, which is built from MySQL Table key info.
+  if ((ret = rpd_table.get()->create_index_memo(context))) return ret;
 
-  // step 2: build indexes.
-  if ((ret = table.get()->create_index_memo(context))) return ret;
+  // step 2: set the load type.
+  rpd_table.get()->set_load_type(LoadType::USER_LOADED);
 
-  table.get()->set_load_type(RapidTable::LoadType::USER_LOADED);
-
-  // Adding the Table meta obj into m_tables/loaded tables meta information.
-  std::string keypart;
-  keypart.append(source->s->db.str).append(":").append(source->s->table_name.str);
-  m_tables.emplace(keypart, std::move(table));
-
+  // step3 : add to rpd_table cahce.
+  std::string sch_tb_name;
+  sch_tb_name.append(source->s->db.str).append(":").append(source->s->table_name.str);
+  m_rpd_tables.emplace(sch_tb_name, std::move(rpd_table));
   return ShannonBase::SHANNON_SUCCESS;
   /* in secondary load phase, the table not loaded into imcs. therefore, it can be seen
      by any transactions. If this table has been loaded into imcs. A new data such as
@@ -327,7 +325,7 @@ int Imcs::load_innodb(const Rapid_load_context *context, ha_innobase *file) {
   m_thd->set_sent_row_count(0);
   std::string key_part;
   key_part.append(context->m_schema_name.c_str()).append(":").append(context->m_table_name.c_str());
-  ut_a(m_tables.find(key_part) != m_tables.end());
+  ut_a(m_rpd_tables.find(key_part) != m_rpd_tables.end());
 
   while ((tmp = file->ha_rnd_next(context->m_table->record[0])) != HA_ERR_END_OF_FILE) {
     /*** ha_rnd_next can return RECORD_DELETED for MyISAM when one thread is reading and another deleting
@@ -341,7 +339,7 @@ int Imcs::load_innodb(const Rapid_load_context *context, ha_innobase *file) {
     });
 
     // ref to `row_sel_store_row_id_to_prebuilt` in row0sel.cc
-    if (m_tables[key_part].get()->write(context, context->m_table->record[0])) {
+    if ((m_rpd_tables[key_part].get()->insert_row(context, context->m_table->record[0])) == INVALID_ROW_ID) {
       std::string errmsg;
       errmsg.append("load data from ")
           .append(context->m_schema_name.c_str())
@@ -369,16 +367,16 @@ int Imcs::load_innodb_parallel(const Rapid_load_context *context, ha_innobase *f
   int tmp{HA_ERR_GENERIC};
 
   m_thd->set_sent_row_count(0);
-  RapidTable *source_table{nullptr};
+  RpdTable *source_table{nullptr};
   std::string key_part;
   {
     std::shared_lock lk(this->m_table_mutex);
     key_part.append(context->m_schema_name.c_str()).append(":").append(context->m_table_name.c_str());
-    if (m_tables.find(key_part) == m_tables.end()) {
+    if (m_rpd_tables.find(key_part) == m_rpd_tables.end()) {
       my_error(ER_NO_SUCH_TABLE, MYF(0), context->m_schema_name.c_str(), context->m_table_name.c_str());
       return HA_ERR_GENERIC;
     }
-    source_table = m_tables[key_part].get();
+    source_table = m_rpd_tables[key_part].get();
   }
 
   struct ScanCtxGuard {
@@ -442,9 +440,9 @@ int Imcs::load_innodb_parallel(const Rapid_load_context *context, ha_innobase *f
     auto data_ptr = static_cast<uchar *>(rowdata);
     auto end_data_ptr = static_cast<uchar *>(rowdata) + ptrdiff_t(nrows * scan_cookie->row_len);
     for (auto index = 0u; index < nrows; data_ptr += ptrdiff_t(scan_cookie->row_len), index++) {
-      if (source_table->write(context, (uchar *)data_ptr, scan_cookie->row_len, scan_cookie->col_offsets.data(),
-                              scan_cookie->n_cols, scan_cookie->null_byte_offsets.data(),
-                              scan_cookie->null_bitmasks.data())) {
+      if ((source_table->insert_row(context, (uchar *)data_ptr, scan_cookie->row_len, scan_cookie->col_offsets.data(),
+                                    scan_cookie->n_cols, scan_cookie->null_byte_offsets.data(),
+                                    scan_cookie->null_bitmasks.data())) == INVALID_ROW_ID) {
         error_flag.store(true);
         std::string errmsg;
         errmsg.append("load data from ")
@@ -771,13 +769,13 @@ int Imcs::unload_innodb(const Rapid_load_context *context, const char *db_name, 
                         bool error_if_not_loaded) {
   std::string key(db_name);
   key.append(":").append(table_name);
-  if (m_tables.find(key) == m_tables.end() && error_if_not_loaded) {
+  if (m_rpd_tables.find(key) == m_rpd_tables.end() && error_if_not_loaded) {
     my_error(ER_NO_SUCH_TABLE, MYF(0), context->m_schema_name, context->m_table_name);
     return HA_ERR_GENERIC;
   }
 
   std::unique_lock lock(m_table_mutex);
-  m_tables.erase(key);
+  m_rpd_tables.erase(key);
 
   shannon_loaded_tables->erase(db_name, table_name);
   return ShannonBase::SHANNON_SUCCESS;

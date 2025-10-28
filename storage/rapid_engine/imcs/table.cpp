@@ -31,6 +31,7 @@
  */
 #include "storage/rapid_engine/imcs/table.h"
 
+#include <regex>
 #include <sstream>
 
 #include "include/ut0dbg.h"  //ut_a
@@ -43,10 +44,10 @@
 #include "storage/rapid_engine/include/rapid_const.h"  // INVALID_ROW_ID
 
 #include "storage/rapid_engine/imcs/index/encoder.h"
+#include "storage/rapid_engine/imcs/predicate.h"  //predicate
 #include "storage/rapid_engine/include/rapid_context.h"
 #include "storage/rapid_engine/include/rapid_status.h"
 #include "storage/rapid_engine/utils/utils.h"  //Blob
-
 namespace ShannonBase {
 namespace Imcs {
 
@@ -865,5 +866,581 @@ int PartTable::build_partitions(const Rapid_load_context *context) {
   return ShannonBase::SHANNON_SUCCESS;
 }
 
+Normal_Table::Normal_Table(const TABLE *&mysql_table, const TableConfig &config) : RpdTable(mysql_table, config) {
+  Utils::MemoryPool::Config mem_config;
+  m_memory_pool = std::make_shared<Utils::MemoryPool>(mem_config);
+  m_memory_pool.get()->set_tenant_quota(shannon_data_arear, SHANNON_DEFAULT_MEMRORY_SIZE);
+
+  m_metadata.db_name = mysql_table->s->db.str;
+  m_metadata.table_name = mysql_table->s->table_name.str;
+  m_metadata.table_id = generate_table_id();
+  m_metadata.rows_per_imcu = config.rows_per_imcu;
+  m_metadata.max_imcu_size_mb = config.max_imcu_size_mb;
+
+  // from MySQL TABLE get fields infor.
+  m_metadata.num_columns = mysql_table->s->fields;
+  m_metadata.fields.reserve(m_metadata.num_columns);
+
+  for (uint32_t ind = 0; ind < m_metadata.num_columns; ind++) {
+    Field *field = mysql_table->field[ind];
+
+    std::string comment;
+    if (field->comment.str && field->comment.length > 0) {
+      comment = std::string(field->comment.str, field->comment.length);
+      std::transform(comment.begin(), comment.end(), comment.begin(), ::toupper);
+    }
+
+    Compress::Encoding_type encoding = Compress::Encoding_type::NONE;
+    const char *const patt_str = "RAPID_COLUMN\\s*=\\s*ENCODING\\s*=\\s*(SORTED|VARLEN)";
+    std::regex column_encoding_patt(patt_str, std::regex_constants::nosubs | std::regex_constants::icase);
+
+    if (std::regex_search(comment, column_encoding_patt)) {
+      if (comment.find("SORTED") != std::string::npos)
+        encoding = Compress::Encoding_type::SORTED;
+      else if (comment.find("VARLEN") != std::string::npos)
+        encoding = Compress::Encoding_type::VARLEN;
+    }
+
+    m_metadata.fields.emplace_back(FieldMetadata{
+        .source_fld = field->clone(m_mem_root.get()),
+        .field_id = ind,
+        .field_name = (field->field_name && field->field_name[0] != '\0') ? std::string(field->field_name) : "unknown",
+        .type = field->type(),
+        .pack_length = field->pack_length(),
+        .normalized_length = Utils::Util::normalized_length(field),
+        .nullable = field->is_nullable(),
+        .is_key = field->is_flag_set(PRI_KEY_FLAG),
+        .is_secondary_field = !field->is_flag_set(NOT_SECONDARY_FLAG),
+        .encoding = encoding,
+        .charset = field->charset(),
+        .dictionary = is_string_type(field->type()) ? std::make_shared<Compress::Dictionary>(encoding) : nullptr,
+        .global_min = 0.0,
+        .global_max = 0.0,
+        .distinct_count = 0,
+        .null_ratio = 0.0});
+  }
+
+  // [TODO] intial global compoent.
+  // m_txn_coordinator = std::make_unique<Transaction_Coordinator>();
+  // m_version_manager = std::make_unique<Global_Version_Manager>();
+  // m_bg_workers = std::make_unique<Background_Worker_Pool>(config.background_worker_threads);
+
+  // create intial IMCU
+  create_initial_imcu();
+}
+
+int Normal_Table::build_hidden_index_memo(const Rapid_load_context *context) {
+  // m_source_keys.emplace(ShannonBase::SHANNON_PRIMARY_KEY_NAME,
+  //                       std::make_pair(SHANNON_DATA_DB_ROW_ID_LEN, std::vector<std::string>{SHANNON_DB_ROW_ID}));
+  m_indexes.emplace(ShannonBase::SHANNON_PRIMARY_KEY_NAME,
+                    std::make_unique<Index::Index<uchar, row_id_t>>(ShannonBase::SHANNON_PRIMARY_KEY_NAME));
+  m_index_mutexes.emplace(ShannonBase::SHANNON_PRIMARY_KEY_NAME, std::make_unique<std::mutex>());
+  return ShannonBase::SHANNON_SUCCESS;
+}
+
+int Normal_Table::build_user_defined_index_memo(const Rapid_load_context *context) {
+  auto source = context->m_table;
+
+  for (auto ind = 0u; ind < source->s->keys; ind++) {
+    auto key_info = source->key_info + ind;
+    std::vector<std::string> key_parts_names;
+    for (uint i = 0u; i < key_info->user_defined_key_parts /**actual_key_parts*/; i++) {
+      key_parts_names.push_back(key_info->key_part[i].field->field_name);
+    }
+
+    // m_source_keys.emplace(key_info->name, std::make_pair(key_info->key_length, key_parts_names));
+    m_indexes.emplace(key_info->name, std::make_unique<Index::Index<uchar, row_id_t>>(key_info->name));
+    m_index_mutexes.emplace(key_info->name, std::make_unique<std::mutex>());
+  }
+
+  return ShannonBase::SHANNON_SUCCESS;
+}
+
+int Normal_Table::build_index_impl(const Rapid_load_context *context, const KEY *key, row_id_t rowid) {
+  // this is come from ha_innodb.cc postion(), when postion() changed, the part should be changed respondingly.
+  // why we dont not change the impl of postion() directly? because the postion() is impled in innodb engine.
+  // we want to decouple with innodb engine.
+  // ref: void key_copy(uchar *to_key, const uchar *from_record, const KEY *key_info,
+  //            uint key_length). Due to we should encoding the float/double/decimal types.
+  auto source = context->m_table;
+
+  if (key == nullptr) {
+    /* No primary key was defined for the table and we generated the clustered index
+     from row id: the row reference will be the row id, not any key value that MySQL
+     knows of */
+    ut_a(source->file->ref_length == ShannonBase::SHANNON_DATA_DB_ROW_ID_LEN);
+
+    const_cast<Rapid_load_context *>(context)->m_extra_info.m_key_len = source->file->ref_length;
+    const_cast<Rapid_load_context *>(context)->m_extra_info.m_key_buff =
+        std::make_unique<uchar[]>(source->file->ref_length);
+    memset(context->m_extra_info.m_key_buff.get(), 0x0, source->file->ref_length);
+    memcpy(context->m_extra_info.m_key_buff.get(), source->file->ref, source->file->ref_length);
+  } else {
+    /* Copy primary key as the row reference */
+    auto from_record = source->record[0];
+
+    const_cast<Rapid_load_context *>(context)->m_extra_info.m_key_len = key->key_length;
+    const_cast<Rapid_load_context *>(context)->m_extra_info.m_key_buff = std::make_unique<uchar[]>(key->key_length);
+    memset(context->m_extra_info.m_key_buff.get(), 0x0, key->key_length);
+    auto to_key = context->m_extra_info.m_key_buff.get();
+    encode_row_key(to_key, from_record, key, key->key_length);
+  }
+  auto keypart = key ? key->name : ShannonBase::SHANNON_PRIMARY_KEY_NAME;
+  {
+    std::lock_guard<std::mutex> lock(*m_index_mutexes[keypart].get());
+    m_indexes[keypart].get()->insert(context->m_extra_info.m_key_buff.get(), context->m_extra_info.m_key_len, &rowid,
+                                     sizeof(rowid));
+  }
+  const_cast<Rapid_load_context *>(context)->m_extra_info.m_key_len = 0;
+  const_cast<Rapid_load_context *>(context)->m_extra_info.m_key_buff.reset(nullptr);
+  return SHANNON_SUCCESS;
+}
+
+// using for parallel load.
+int Normal_Table::build_index_impl(const Rapid_load_context *context, const KEY *key, row_id_t rowid, uchar *rowdata,
+                                   ulong *col_offsets, ulong *null_byte_offsets, ulong *null_bitmasks) {
+  // this is come from ha_innodb.cc postion(), when postion() changed, the part should be changed respondingly.
+  // why we dont not change the impl of postion() directly? because the postion() is impled in innodb engine.
+  // we want to decouple with innodb engine.
+  auto source = context->m_table;
+  std::unique_ptr<uchar[]> key_buff{nullptr};
+  auto key_len{0u};
+  if (key == nullptr) {
+    /* No primary key was defined for the table and we generated the clustered index
+     from row id: the row reference will be the row id, not any key value that MySQL
+     knows of */
+    // In parallel scan, the primary key must be have, otherwise sequential scan.
+
+    ut_a(source->file->ref_length == SHANNON_DATA_DB_ROW_ID_LEN);
+    key_len = source->file->ref_length;
+    key_buff.reset(new uchar[key_len]);
+    memset(key_buff.get(), 0x0, key_len);
+    memcpy(key_buff.get(), source->file->ref, key_len);
+  } else {
+    /* Copy primary key as the row reference */
+    key_len = key->key_length;
+    key_buff.reset(new uchar[key_len]);
+    memset(key_buff.get(), 0x0, key_len);
+    auto to_key = key_buff.get();
+    std::shared_mutex key_buff_mutex;
+    encode_key_from_row(rowdata, col_offsets, null_byte_offsets, null_bitmasks, key, to_key, key_buff_mutex);
+  }
+
+  auto keypart = key ? key->name : ShannonBase::SHANNON_PRIMARY_KEY_NAME;
+  {
+    std::lock_guard<std::mutex> lock(*m_index_mutexes[keypart].get());
+    m_indexes[keypart].get()->insert(key_buff.get(), key_len, &rowid, sizeof(rowid));
+  }
+  return SHANNON_SUCCESS;
+}
+
+int Normal_Table::build_index(const Rapid_load_context *context, const KEY *key, row_id_t rowid) {
+  return build_index_impl(context, key, rowid);
+}
+
+// using for parallel load.
+int Normal_Table::build_index(const Rapid_load_context *context, const KEY *key, row_id_t rowid, uchar *rowdata,
+                              ulong *col_offsets, ulong *null_byte_offsets, ulong *null_bitmasks) {
+  return build_index_impl(context, key, rowid, rowdata, col_offsets, null_byte_offsets, null_bitmasks);
+}
+
+int Normal_Table::build_key_info(const Rapid_load_context *context, const KEY *key) {
+  // this is come from ha_innodb.cc postion(), when postion() changed, the part should be changed respondingly.
+  // why we dont not change the impl of postion() directly? because the postion() is impled in innodb engine.
+  // we want to decouple with innodb engine.
+  // ref: void key_copy(uchar *to_key, const uchar *from_record, const KEY *key_info,
+  //            uint key_length). Due to we should encoding the float/double/decimal types.
+  auto source = context->m_table;
+
+  if (key == nullptr) {
+    /* No primary key was defined for the table and we generated the clustered index
+     from row id: the row reference will be the row id, not any key value that MySQL
+     knows of */
+    ut_a(source->file->ref_length == ShannonBase::SHANNON_DATA_DB_ROW_ID_LEN);
+
+    const_cast<Rapid_load_context *>(context)->m_extra_info.m_key_len = source->file->ref_length;
+    const_cast<Rapid_load_context *>(context)->m_extra_info.m_key_buff =
+        std::make_unique<uchar[]>(source->file->ref_length);
+    memset(context->m_extra_info.m_key_buff.get(), 0x0, source->file->ref_length);
+    memcpy(context->m_extra_info.m_key_buff.get(), source->file->ref, source->file->ref_length);
+  } else {
+    /* Copy primary key as the row reference */
+    auto from_record = source->record[0];
+
+    const_cast<Rapid_load_context *>(context)->m_extra_info.m_key_len = key->key_length;
+    const_cast<Rapid_load_context *>(context)->m_extra_info.m_key_buff = std::make_unique<uchar[]>(key->key_length);
+    memset(context->m_extra_info.m_key_buff.get(), 0x0, key->key_length);
+    auto to_key = context->m_extra_info.m_key_buff.get();
+    encode_row_key(to_key, from_record, key, key->key_length);
+  }
+
+  return SHANNON_SUCCESS;
+}
+
+int Normal_Table::build_key_info(const Rapid_load_context *context, const KEY *key, uchar *rowdata, ulong *col_offsets,
+                                 ulong *null_byte_offsets, ulong *null_bitmasks) {
+  // this is come from ha_innodb.cc postion(), when postion() changed, the part should be changed respondingly.
+  // why we dont not change the impl of postion() directly? because the postion() is impled in innodb engine.
+  // we want to decouple with innodb engine.
+  auto source = context->m_table;
+
+  if (key == nullptr) {
+    /* No primary key was defined for the table and we generated the clustered index
+     from row id: the row reference will be the row id, not any key value that MySQL
+     knows of */
+    ut_a(source->file->ref_length == ShannonBase::SHANNON_DATA_DB_ROW_ID_LEN);
+
+    const_cast<Rapid_load_context *>(context)->m_extra_info.m_key_len = source->file->ref_length;
+    const_cast<Rapid_load_context *>(context)->m_extra_info.m_key_buff =
+        std::make_unique<uchar[]>(source->file->ref_length);
+    memset(context->m_extra_info.m_key_buff.get(), 0x0, source->file->ref_length);
+    memcpy(context->m_extra_info.m_key_buff.get(), source->file->ref, source->file->ref_length);
+  } else {
+    /* Copy primary key as the row reference */
+    const_cast<Rapid_load_context *>(context)->m_extra_info.m_key_len = key->key_length;
+    const_cast<Rapid_load_context *>(context)->m_extra_info.m_key_buff = std::make_unique<uchar[]>(key->key_length);
+    memset(context->m_extra_info.m_key_buff.get(), 0x0, key->key_length);
+    auto to_key = context->m_extra_info.m_key_buff.get();
+    std::shared_mutex key_buff_mutex;
+    encode_key_from_row(rowdata, col_offsets, null_byte_offsets, null_bitmasks, key, to_key, key_buff_mutex);
+  }
+
+  return SHANNON_SUCCESS;
+}
+
+int Normal_Table::create_index_memo(const Rapid_load_context *context) {
+  auto source = context->m_table;
+  ut_a(source);
+  // no.1: primary key. using row_id as the primary key when missing user-defined pk.
+  if (source->s->is_missing_primary_key()) build_hidden_index_memo(context);
+
+  // no.2: user-defined indexes.
+  build_user_defined_index_memo(context);
+  return ShannonBase::SHANNON_SUCCESS;
+}
+
+row_id_t Normal_Table::insert_row(const Rapid_load_context *context, const uchar *data) {
+  Imcu *current_imcu = get_or_create_write_imcu();
+  if (!current_imcu) {
+    return INVALID_ROW_ID;
+  }
+
+  Utils::ColumnMapGuard guard(context->m_table);
+  RowBuffer row_data(context->m_table->s->fields);
+  row_data.copy_from_mysql_fields(context->m_table->field, context->m_table->s->fields);
+
+  row_id_t local_row_id = current_imcu->insert_row(context, row_data);
+  if (local_row_id == INVALID_ROW_ID) {  // imcu is full, then create a new one.
+    current_imcu = get_or_create_write_imcu();
+    if (!current_imcu) return INVALID_ROW_ID;
+
+    local_row_id = current_imcu->insert_row(context, row_data);
+  }
+
+  row_id_t global_row_id = current_imcu->get_start_row() + local_row_id;
+
+  if (context->m_table->s->is_missing_primary_key()) {
+    context->m_table->file->position((const uchar *)context->m_table->record[0]);  // to set DB_ROW_ID.
+    if (build_index(context, nullptr, global_row_id)) return HA_ERR_GENERIC;
+  }
+
+  for (auto index = 0u; index < context->m_table->s->keys; index++) {
+    auto key_info = context->m_table->key_info + index;
+    if (build_index(context, key_info, global_row_id)) return HA_ERR_GENERIC;
+    /*
+     *In MySQL table index processing, adopting the strategy of "explicit primary key first, unique index as fallback"
+     *is reasonable and common practice when determining the primary key. This logic first iterates through the table's
+     *key_info array to find an explicit primary key (with HA_PRIMARY_KEY flag), selecting it directly if present. If no
+     *explicit primary key exists, it chooses the first suitable unique index (with HA_NOSAME flag) as the de facto
+     *primary key.
+     */
+    break;
+  }
+  // update statistics
+  m_metadata.total_rows.fetch_add(1);
+
+  return global_row_id;
+}
+
+row_id_t Normal_Table::insert_row(const Rapid_load_context *context, uchar *rowdata, size_t len, ulong *col_offsets,
+                                  size_t n_cols, ulong *null_byte_offsets, ulong *null_bitmasks) {
+  ut_a(context->m_table->s->fields == n_cols);
+
+  Imcu *current_imcu = get_or_create_write_imcu();
+  if (!current_imcu) {
+    return INVALID_ROW_ID;
+  }
+
+  Utils::ColumnMapGuard guard(context->m_table);
+  RowBuffer row_data(context->m_table->s->fields);
+  row_data.copy_from_mysql_fields(context->m_table->field, rowdata, len, col_offsets, n_cols, null_byte_offsets,
+                                  null_bitmasks);
+
+  row_id_t local_row_id = current_imcu->insert_row(context, row_data);
+  if (local_row_id == INVALID_ROW_ID) {  // imcu is full, then create a new one.
+    current_imcu = get_or_create_write_imcu();
+    if (!current_imcu) return INVALID_ROW_ID;
+
+    local_row_id = current_imcu->insert_row(context, row_data);
+  }
+
+  row_id_t global_row_id = current_imcu->get_start_row() + local_row_id;
+
+  if (context->m_table->s->is_missing_primary_key()) {
+    context->m_table->file->position((const uchar *)context->m_table->record[0]);  // to set DB_ROW_ID.
+    if (build_index(context, nullptr, global_row_id)) return HA_ERR_GENERIC;
+  }
+
+  for (auto index = 0u; index < context->m_table->s->keys; index++) {
+    auto key_info = context->m_table->key_info + index;
+    if (build_index(context, key_info, global_row_id)) return HA_ERR_GENERIC;
+    break;
+  }
+
+  // update statistics
+  m_metadata.total_rows.fetch_add(1);
+
+  return global_row_id;
+}
+
+int Normal_Table::delete_row(const Rapid_load_context *context, row_id_t global_row_id) {
+  // 1. locate IMCU
+  Imcu *imcu = locate_imcu(global_row_id);
+  if (!imcu) return HA_ERR_KEY_NOT_FOUND;
+
+  // 2. calc row_id
+  assert((imcu->get_start_row() % m_metadata.rows_per_imcu) == 0);
+  row_id_t local_row_id = global_row_id - imcu->get_start_row();
+
+  // 3. delete row from IMCU.
+  auto success = imcu->delete_row(context, local_row_id);
+
+  if (success) return success;  // return on error.
+
+  // 4. update statistics if delete operation succeeded.
+  m_metadata.deleted_rows.fetch_add(1);
+  m_metadata.version_count.fetch_add(1);
+
+  return ShannonBase::SHANNON_SUCCESS;
+}
+
+size_t Normal_Table::delete_rows(const Rapid_load_context *context, const std::vector<row_id_t> &row_ids) {
+  // 1. the IMCU candidate group.
+  std::unordered_map<Imcu *, std::vector<row_id_t>> imcu_groups;
+
+  for (row_id_t global_row_id : row_ids) {
+    Imcu *imcu = locate_imcu(global_row_id);
+    if (imcu) {
+      row_id_t local_row_id = global_row_id - imcu->get_start_row();
+      imcu_groups[imcu].push_back(local_row_id);
+    }
+  }
+
+  // 2. delete rows in IMCU.
+  size_t total_deleted = 0;
+
+  for (auto &[imcu, local_ids] : imcu_groups) total_deleted += imcu->delete_rows(context, local_ids);
+
+  // 3. update statistics.
+  m_metadata.deleted_rows.fetch_add(total_deleted);
+
+  return total_deleted;
+}
+
+int Normal_Table::delete_row(const Rapid_load_context *context, uchar *rowdata, size_t len, ulong *col_offsets,
+                             size_t n_cols, ulong *null_byte_offsets, ulong *null_bitmasks) {
+  auto ret{ShannonBase::SHANNON_SUCCESS};
+  auto global_row_id = locate_row(context, rowdata, len, col_offsets, n_cols, null_byte_offsets, null_bitmasks);
+  if (global_row_id == INVALID_ROW_ID) return HA_ERR_KEY_NOT_FOUND;
+
+  if ((ret = delete_row(context, global_row_id))) {
+    std::string errmsg;
+    errmsg.append("delete from rapid ")
+        .append(context->m_schema_name.c_str())
+        .append(".")
+        .append(context->m_table_name.c_str())
+        .append(" failed.");
+    my_error(ER_SECONDARY_ENGINE, MYF(0), errmsg.c_str());
+    return ret;
+  }
+
+  return ShannonBase::SHANNON_SUCCESS;
+}
+
+int Normal_Table::update_row(const Rapid_load_context *context, row_id_t global_row_id,
+                             const std::unordered_map<uint32_t, RowBuffer::ColumnValue> &updates) {
+  // 1. locate IMCU.
+  Imcu *imcu = locate_imcu(global_row_id);
+  if (!imcu) return false;
+
+  // 2. calc row_id.
+  row_id_t local_row_id = global_row_id - imcu->get_start_row();
+
+  // 3. update.
+  return imcu->update_row(context, local_row_id, updates);
+}
+
+row_id_t Normal_Table::locate_row(const Rapid_load_context *context, const uchar *rowdata /*record[0]*/) {
+  std::string sch_tb_name = context->m_schema_name;
+  sch_tb_name.append(":").append(context->m_table_name);
+
+  if (context->m_table->s->is_missing_primary_key()) {
+    context->m_table->file->position((const uchar *)rowdata);  // to set DB_ROW_ID.
+    if (build_key_info(context, nullptr, const_cast<uchar *>(rowdata), nullptr, nullptr, nullptr))
+      return HA_ERR_GENERIC;
+  }
+
+  Utils::ColumnMapGuard guard(context->m_table);
+  context->m_table->record[0] = const_cast<uchar *>(rowdata);
+  for (auto index = 0u; index < context->m_table->s->keys; index++) {
+    auto key_info = context->m_table->key_info + index;
+    if (build_key_info(context, key_info)) return HA_ERR_GENERIC;
+    break;
+  }
+  auto rowid = m_indexes[ShannonBase::SHANNON_PRIMARY_KEY_NAME].get()->lookup(context->m_extra_info.m_key_buff.get(),
+                                                                              context->m_extra_info.m_key_len);
+  auto global_row_id = rowid ? *rowid : INVALID_ROW_ID;
+  return global_row_id;
+}
+
+row_id_t Normal_Table::locate_row(const Rapid_load_context *context, uchar *rowdata, size_t len, ulong *col_offsets,
+                                  size_t n_cols, ulong *null_byte_offsets, ulong *null_bitmasks) {
+  std::string sch_tb_name = context->m_schema_name;
+  sch_tb_name.append(":").append(context->m_table_name);
+
+  if (context->m_table->s->is_missing_primary_key()) {
+    context->m_table->file->position((const uchar *)rowdata);  // to set DB_ROW_ID.
+    if (build_key_info(context, nullptr, rowdata, nullptr, nullptr, nullptr)) return HA_ERR_GENERIC;
+  }
+
+  Utils::ColumnMapGuard guard(context->m_table);
+  for (auto index = 0u; index < context->m_table->s->keys; index++) {
+    auto key_info = context->m_table->key_info + index;
+    if (build_key_info(context, key_info, rowdata, col_offsets, null_byte_offsets, null_bitmasks))
+      return HA_ERR_GENERIC;
+    break;
+  }
+  auto rowid = m_indexes[ShannonBase::SHANNON_PRIMARY_KEY_NAME].get()->lookup(context->m_extra_info.m_key_buff.get(),
+                                                                              context->m_extra_info.m_key_len);
+  auto global_row_id = rowid ? *rowid : INVALID_ROW_ID;
+  return global_row_id;
+}
+
+int Normal_Table::scan_table(Rapid_scan_context *context, const std::vector<std::unique_ptr<Predicate>> &predicates,
+                             const std::vector<uint32_t> &projection, RowCallback callback) {
+  // 1. travel all IMCUs.
+  for (auto &imcu : m_imcus) {
+    // 1.1 Storage Index to filter（skip IMCU ）
+    if (imcu->can_skip_imcu(predicates)) {
+      continue;  // skip IMCU
+    }
+
+    // 1.2 scan IMCU
+    imcu->scan(context, predicates, projection, callback);
+
+    // 1.3 check LIMIT oper.
+    if (context->limit > 0 && context->rows_returned >= context->limit) {
+      break;
+    }
+  }
+
+  return ShannonBase::SHANNON_SUCCESS;
+}
+
+bool Normal_Table::read(Rapid_scan_context *context, const uchar *key_value, Row_Result &result) { return false; }
+
+bool Normal_Table::range_scan(Rapid_scan_context *context, const uchar *start_key, const uchar *end_key,
+                              RowCallback callback) {
+  assert(context && start_key && end_key);
+  return false;
+}
+
+uint64_t Normal_Table::get_row_count(const Rapid_scan_context *context) const {
+  assert(context);
+
+  return 0;
+}
+
+ColumnStatistics Normal_Table::get_column_stats(uint32_t col_idx) const {
+  assert(col_idx);
+
+  ColumnStatistics col_stat(col_idx, "col_name", MYSQL_TYPE_NULL);
+  return col_stat;
+}
+
+void Normal_Table::update_statistics(bool force) {
+  if (force) {
+  }
+}
+
+size_t Normal_Table::garbage_collect(uint64_t min_active_scn) {
+  size_t total_freed = 0;
+
+  // 1. perform GC on each IMCU.
+  for (auto &imcu : m_imcus) {
+    total_freed += imcu->garbage_collect(min_active_scn);
+  }
+
+  // 2. update global version count.
+  m_metadata.version_count.fetch_sub(total_freed);
+
+  return total_freed;
+  return 0;
+}
+
+size_t Normal_Table::compact_imcus(double delete_ratio_threshold) {
+  size_t total_freed = 0;
+
+  std::vector<std::shared_ptr<Imcu>> new_imcus;
+
+  for (auto &imcu : m_imcus) {
+    if (imcu->needs_compaction() && imcu->get_delete_ratio() >= delete_ratio_threshold) {
+      // compact the IMCU.
+      auto compacted = imcu->compact();
+      if (compacted) {
+        new_imcus.emplace_back(compacted);
+        total_freed += imcu->estimate_size() - compacted->estimate_size();
+      } else {
+        new_imcus.emplace_back(imcu);
+      }
+    } else {
+      new_imcus.emplace_back(imcu);
+    }
+  }
+
+  // change atomically.
+  {
+    std::unique_lock lock(m_table_mutex);
+    m_imcus = std::move(new_imcus);
+    build_imcu_index();
+  }
+
+  return total_freed;
+}
+
+bool Normal_Table::reorganize() { return false; }
+
+Imcu *Normal_Table::get_or_create_write_imcu() {
+  Imcu *current = m_current_imcu.load();
+
+  if (current && !current->is_full()) {
+    return current;
+  }
+
+  /**
+   * EACH MCU CONTAINS `SHANNON_ROWS_IN_CHUNK` (DEFAULT) ROWS.
+   */
+  std::unique_lock lock(m_table_mutex);
+  row_id_t start_row = m_imcus.empty() ? 0 : m_imcus.size() * m_metadata.rows_per_imcu;
+
+  auto new_imcu = std::make_shared<Imcu>(this, m_metadata, start_row /*start_row_#*/,
+                                         m_metadata.rows_per_imcu /*capacity*/, m_memory_pool);
+  m_imcus.push_back(new_imcu);
+  m_current_imcu.store(new_imcu.get());
+
+  update_imcu_index(new_imcu.get());
+
+  return new_imcu.get();
+}
 }  // namespace Imcs
 }  // namespace ShannonBase

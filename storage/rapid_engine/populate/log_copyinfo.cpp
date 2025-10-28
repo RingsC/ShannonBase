@@ -27,12 +27,14 @@
    The fundmental code for imcs. The chunk is used to store the data which
    transfer from row-based format to column-based format.
 */
+#include "storage/rapid_engine/populate/log_copyinfo.h"
 
 #include <string>
+#include <unordered_map>
 
 #include "storage/rapid_engine/imcs/imcs.h"
+#include "storage/rapid_engine/imcs/imcu.h"
 #include "storage/rapid_engine/imcs/table.h"
-#include "storage/rapid_engine/populate/log_copyinfo.h"
 
 namespace ShannonBase {
 namespace Populate {
@@ -102,6 +104,7 @@ uint CopyInfoParser::parse_copy_info(Rapid_load_context *context, change_record_
   context->m_trx = Transaction::get_or_create_trx(current_thd);
   context->m_trx->begin();
   context->m_extra_info.m_trxid = context->m_trx->get_id();
+  context->m_extra_info.m_scn = context->m_extra_info.m_trxid;
 
   auto ret{ShannonBase::SHANNON_SUCCESS};
   switch (oper_type) {
@@ -123,12 +126,15 @@ uint CopyInfoParser::parse_copy_info(Rapid_load_context *context, change_record_
   return ret;
 }
 
-int CopyInfoParser::parse_and_apply_update(Rapid_load_context *context, TABLE *table, const byte *start,
-                                           const byte *end_ptr, const byte *new_start, const byte *new_end_ptr) {
+int CopyInfoParser::parse_and_apply_update(Rapid_load_context *context, TABLE *table, const byte *old_start,
+                                           const byte *old_end_ptr, const byte *new_start, const byte *new_end_ptr) {
+  assert((old_end_ptr - old_start) == context->m_table->s->rec_buff_length);
+  assert((new_end_ptr - new_start) == context->m_table->s->rec_buff_length);
+
   std::string sch_tb_name = context->m_schema_name;
   sch_tb_name.append(":").append(context->m_table_name);
 
-  auto rpd_table = ShannonBase::Imcs::Imcs::instance()->get_table(sch_tb_name);
+  auto rpd_table = ShannonBase::Imcs::Imcs::instance()->get_rpd_table(sch_tb_name);
   if (!rpd_table) {
     std::string err_msg = "Cannot get the table ";
     err_msg.append(context->m_schema_name).append(".").append(context->m_table_name).append(" from loaded tables");
@@ -136,18 +142,46 @@ int CopyInfoParser::parse_and_apply_update(Rapid_load_context *context, TABLE *t
     return 0;  // parsed bytes.
   }
 
-  std::string key{table->s->db.str};
-  key.append(":").append(table->s->table_name.str);
+  auto rec_len = old_end_ptr - old_start;
+  auto global_row_id =
+      rpd_table->locate_row(context, (uchar *)old_start, rec_len, m_col_offsets[sch_tb_name].data(), m_n_fields,
+                            m_null_byte_offsets[sch_tb_name].data(), m_null_bitmasks[sch_tb_name].data());
 
-  size_t row_size = end_ptr - start;
-  if (rpd_table->update_row(context, row_size, m_col_offsets[key].data(), m_null_byte_offsets[key].data(),
-                            m_null_bitmasks[key].data(), (const uchar *)start, (const uchar *)new_start)) {
+  // step 1: to parse the changed fields. <changed col id, new_value>
+  size_t row_size = old_end_ptr - old_start;
+  std::unordered_map<uint32_t, ShannonBase::Imcs::RowBuffer::ColumnValue> updates;
+  for (size_t idx = 0; idx < m_n_fields; idx++) {
+    Field *field = table->field[idx];
+
+    ptrdiff_t offset = m_col_offsets[sch_tb_name][idx];
+    size_t field_length = field->pack_length();
+
+    // comp field is changed or not.
+    if (memcmp(old_start + offset, new_start + offset, field_length) != 0) {  // record has been changed.
+      // read the new value.
+      std::unique_ptr<uchar[]> new_val = std::make_unique<uchar[]>(field_length);
+      std::memcpy(new_val.get(), new_start + offset, field_length);
+
+      ShannonBase::Imcs::RowBuffer::ColumnValue col_val;
+      col_val.owned_buffer = std::move(new_val);
+      col_val.length = field_length;
+      col_val.data = col_val.owned_buffer.get();
+      col_val.type = field->type();
+      col_val.flags.is_null = field->is_null();
+      col_val.flags.is_zero_copy = false;
+      col_val.flags.needs_decode = false;
+      updates.emplace(idx, std::move(col_val));
+    }
+  }
+
+  // step 2: update row.
+  if (rpd_table->update_row(context, global_row_id, updates)) {
     std::string errmsg;
-    errmsg.append("load data from ")
+    errmsg.append("[popragate] update in rapid ")
         .append(context->m_schema_name.c_str())
         .append(".")
         .append(context->m_table_name.c_str())
-        .append(" to imcs failed.");
+        .append(" failed");
     my_error(ER_SECONDARY_ENGINE, MYF(0), errmsg.c_str());
     return 0;
   }
@@ -159,7 +193,7 @@ int CopyInfoParser::parse_and_apply_insert(Rapid_load_context *context, TABLE *t
   std::string sch_tb_name = context->m_schema_name;
   sch_tb_name.append(":").append(context->m_table_name);
 
-  auto rpd_table = ShannonBase::Imcs::Imcs::instance()->get_table(sch_tb_name);
+  auto rpd_table = ShannonBase::Imcs::Imcs::instance()->get_rpd_table(sch_tb_name);
   if (!rpd_table) {
     std::string err_msg = "Cannot get the table ";
     err_msg.append(context->m_schema_name).append(".").append(context->m_table_name).append(" from loaded tables");
@@ -167,30 +201,33 @@ int CopyInfoParser::parse_and_apply_insert(Rapid_load_context *context, TABLE *t
     return 0;  // parsed bytes.
   }
 
-  std::string key{table->s->db.str};
-  key.append(":").append(table->s->table_name.str);
-
   size_t row_size = end_ptr - start;
-  if (rpd_table->write(context, (uchar *)start, row_size, m_col_offsets[key].data(), m_n_fields,
-                       m_null_byte_offsets[key].data(), m_null_bitmasks[key].data())) {
+  assert(row_size == context->m_table->s->rec_buff_length);
+  if (rpd_table->insert_row(context, (uchar *)start, row_size, m_col_offsets[sch_tb_name].data(), m_n_fields,
+                            m_null_byte_offsets[sch_tb_name].data(),
+                            m_null_bitmasks[sch_tb_name].data()) == INVALID_ROW_ID) {
     std::string errmsg;
-    errmsg.append("load data from ")
+    errmsg.append("[popragate] inset into rapid ")
         .append(context->m_schema_name.c_str())
         .append(".")
         .append(context->m_table_name.c_str())
-        .append(" to imcs failed.");
+        .append(" to imcs failed");
     my_error(ER_SECONDARY_ENGINE, MYF(0), errmsg.c_str());
     return 0;
   }
+
   return row_size;
 }
 
 int CopyInfoParser::parse_and_apply_delete(Rapid_load_context *context, TABLE *table, const byte *start,
                                            const byte *end_ptr) {
+  size_t row_size = end_ptr - start;
+  assert(row_size == context->m_table->s->rec_buff_length);
+
   std::string sch_tb_name = context->m_schema_name;
   sch_tb_name.append(":").append(context->m_table_name);
 
-  auto rpd_table = ShannonBase::Imcs::Imcs::instance()->get_table(sch_tb_name);
+  auto rpd_table = ShannonBase::Imcs::Imcs::instance()->get_rpd_table(sch_tb_name);
   if (!rpd_table) {
     std::string err_msg = "Cannot get the table ";
     err_msg.append(context->m_schema_name).append(".").append(context->m_table_name).append(" from loaded tables");
@@ -198,14 +235,10 @@ int CopyInfoParser::parse_and_apply_delete(Rapid_load_context *context, TABLE *t
     return 0;  // parsed bytes.
   }
 
-  std::string key{table->s->db.str};
-  key.append(":").append(table->s->table_name.str);
-
-  size_t row_size = end_ptr - start;
-  if (rpd_table->delete_row(context, (uchar *)start, row_size, m_col_offsets[key].data(), m_n_fields,
-                            m_null_byte_offsets[key].data(), m_null_bitmasks[key].data())) {
+  if (rpd_table->delete_row(context, (uchar *)start, row_size, m_col_offsets[sch_tb_name].data(), m_n_fields,
+                            m_null_byte_offsets[sch_tb_name].data(), m_null_bitmasks[sch_tb_name].data())) {
     std::string errmsg;
-    errmsg.append("load data from ")
+    errmsg.append("[popragate] delete from rapid ")
         .append(context->m_schema_name.c_str())
         .append(".")
         .append(context->m_table_name.c_str())
