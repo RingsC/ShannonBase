@@ -64,6 +64,7 @@
 #include "sql/range_optimizer/reverse_index_range_scan.h"
 #include "sql/range_optimizer/rowid_ordered_retrieval.h"
 
+#include "storage/rapid_engine/optimizer/writable_access_path.inc" //RapidScanParameters
 #include "storage/rapid_engine/executor/iterators/aggregate_iterator.h"
 #include "storage/rapid_engine/executor/iterators/hash_join_iterator.h"
 #include "storage/rapid_engine/executor/iterators/iterator.h"
@@ -71,9 +72,7 @@
 #include "storage/rapid_engine/utils/utils.h"
 namespace ShannonBase {
 namespace Optimizer {
-
 using pack_rows::TableCollection;
-
 struct IteratorToBeCreated {
   AccessPath *path;
   JOIN *join;
@@ -290,6 +289,9 @@ unique_ptr_destroy_only<RowIterator> PathGenerator::CreateIteratorFromAccessPath
     switch (path->type) {
       case AccessPath::TABLE_SCAN: {
         const auto &param = path->table_scan();
+        if (path->secondary_engine_data) {
+          auto rapid_scan_param [[maybe_unused]]= static_cast<RapidScanParameters*>(path->secondary_engine_data);
+        }
         if (path->vectorized &&
             param.table->s->table_category ==
                 enum_table_category::TABLE_CATEGORY_USER)  // Here param.table maybe a temp table/in-memory temp table.)
