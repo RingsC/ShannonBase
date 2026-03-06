@@ -57,7 +57,7 @@
 #include "storage/rapid_engine/include/rapid_column_info.h"
 #include "storage/rapid_engine/include/rapid_config.h"
 #include "storage/rapid_engine/include/rapid_context.h"
-#include "storage/rapid_engine/recovery/load_persist.h"
+#include "storage/rapid_engine/recovery/recovery_load.h"
 #include "storage/rapid_engine/utils/utils.h"  //Utils
 
 namespace ShannonBase {

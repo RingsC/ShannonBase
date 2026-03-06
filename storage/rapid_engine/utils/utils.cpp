@@ -85,59 +85,86 @@ TABLE *Util::open_table_by_name(THD *thd, std::string schema_name, std::string t
    *    close_thread_tables(thd);
    */
 
-  /*
-  TABLE *table{nullptr};
-  for (table = thd->open_tables; table; table = table->next) {
-    auto db_flag = !strncmp(schema_name.c_str(), table->s->db.str, table->s->db.length);
-    auto tb_flag = !strncmp(table_name.c_str(), table->s->table_name.str, table->s->table_name.length);
-    if (table->s && table->file && (table->file->inited != handler::NONE) && db_flag && tb_flag) {
-      return table;
-    }
-  }
+  /**
+   *   TABLE *table{nullptr};
+   *   for (table = thd->open_tables; table; table = table->next) {
+   *     auto db_flag = !strncmp(schema_name.c_str(), table->s->db.str, table->s->db.length);
+   *     auto tb_flag = !strncmp(table_name.c_str(), table->s->table_name.str, table->s->table_name.length);
+   *     if (table->s && table->file && (table->file->inited != handler::NONE) && db_flag && tb_flag) {
+   *       return table;
+   *     }
+   *   }
+   *
+   *   auto old_mode = thd->locked_tables_mode;
+   *   if (thd->locked_tables_mode == LTM_PRELOCKED) {
+   *     thd->locked_tables_mode = LTM_NONE;
+   *   }
+   *
+   *   Open_table_context table_ref_context(thd, MYSQL_OPEN_IGNORE_GLOBAL_READ_LOCK);
+   *
+   *   Table_ref table_ref(schema_name.c_str(), table_name.c_str(), lk_mode);
+   *   table_ref.open_strategy = Table_ref::OPEN_NORMAL;
+   *
+   *   if (open_table(thd, &table_ref, &table_ref_context) || !table_ref.table->file) {
+   *     sql_print_warning("Failed to open table %s.%s", schema_name, table_name);
+   *     return nullptr;
+   *   }
+   *
+   *   auto table_ptr = table_ref.table;
+   *   if (!table_ptr->next_number_field)  // in case.
+   *     table_ptr->next_number_field = table_ptr->found_next_number_field;
+   *   thd->locked_tables_mode = old_mode;
+   *
+   *   if (!table_ptr->file) return nullptr;
+   *   if (table_ptr->file->ha_external_lock(thd, F_WRLCK)) {
+   *     return nullptr;
+   *   }
+   */
+  /**
+   * Three things must be derived from the caller's requested lk_mode:
+   *
+   *   1. table_list.set_lock  – the MySQL thr_lock_type sent to the handler's
+   *      store_lock().  Was hardcoded to TL_READ; write callers (set_flag)
+   *      got wrong lock type.
+   *
+   *   2. MDL request type – must match the thr-lock intent.  MDL_SHARED_READ
+   *      is insufficient for a write; InnoDB would see an inconsistent state
+   *      and crash in close_thread_tables / ha_update_row.
+   *
+   *   3. ha_external_lock – MUST always be F_WRLCK regardless of whether the
+   *      open is logically a read or write.  Reason: open_table_by_name is
+   *      only ever called from inside server-internal DDL / recovery code that
+   *      runs within an existing write transaction context (ALTER TABLE,
+   *      DROP TABLE, plugin init).  In those contexts InnoDB's store_lock
+   *      (called by open_tables) sets select_lock_type = LOCK_X even for
+   *      TL_READ_WITH_SHARED_LOCKS.  Calling ha_external_lock(F_RDLCK=0) when
+   *      select_lock_type is already LOCK_X fires the InnoDB assertion:
+   *        !(lock_type == 0 && m_prebuilt->select_lock_type == LOCK_X)
+   *      F_WRLCK is always safe here; it is "more exclusive than needed" for
+   *      pure reads but does not violate any InnoDB invariant.
+   */
+  const bool is_write = (lk_mode >= TL_WRITE_ALLOW_WRITE);
+  const enum_mdl_type mdl_type = is_write ? MDL_SHARED_WRITE : MDL_SHARED_READ;
 
-  auto old_mode = thd->locked_tables_mode;
-  if (thd->locked_tables_mode == LTM_PRELOCKED) {
-    thd->locked_tables_mode = LTM_NONE;
-  }
-
-  Open_table_context table_ref_context(thd, MYSQL_OPEN_IGNORE_GLOBAL_READ_LOCK);
-
-  Table_ref table_ref(schema_name.c_str(), table_name.c_str(), lk_mode);
-  table_ref.open_strategy = Table_ref::OPEN_NORMAL;
-
-  if (open_table(thd, &table_ref, &table_ref_context) || !table_ref.table->file) {
-    sql_print_warning("Failed to open table %s.%s", schema_name, table_name);
-    return nullptr;
-  }
-
-  auto table_ptr = table_ref.table;
-  if (!table_ptr->next_number_field)  // in case.
-    table_ptr->next_number_field = table_ptr->found_next_number_field;
-  thd->locked_tables_mode = old_mode;
-
-  if (!table_ptr->file) return nullptr;
-  if (table_ptr->file->ha_external_lock(thd, F_WRLCK)) {
-    return nullptr;
-  }
-*/
   Table_ref table_list;
   table_list.db = schema_name.c_str();
   table_list.db_length = schema_name.length();
   table_list.table_name = table_name.c_str();
   table_list.table_name_length = table_name.length();
   table_list.alias = table_name.c_str();
-  table_list.set_lock({TL_READ, THR_DEFAULT});
+  table_list.set_lock({lk_mode, THR_DEFAULT});  // was hardcoded TL_READ
   MDL_REQUEST_INIT(&table_list.mdl_request,
                    MDL_key::TABLE,       // namespace
                    schema_name.c_str(),  // db
                    table_name.c_str(),   // name
-                   MDL_SHARED_READ,      // type
+                   mdl_type,             // derived from lk_mode; was hardcoded MDL_SHARED_READ
                    MDL_TRANSACTION);     // duration
 
   Table_ref *table_list_ptr = &table_list;
   uint counter{0};
   uint flags = MYSQL_OPEN_GET_NEW_TABLE | MYSQL_OPEN_IGNORE_FLUSH;
   if (open_tables(thd, &table_list_ptr, &counter, flags)) return nullptr;
+  // Always F_WRLCK – see explanation above.
   if (table_list.table->file->ha_external_lock(thd, F_WRLCK)) return nullptr;
 
   return table_list.table;

@@ -30,6 +30,7 @@
 #include "include/my_dbug.h"
 #include "sql/handler.h"    // handler::ha_records
 #include "sql/mysqld.h"     // mysqld_server_started
+#include "sql/sql_base.h"   // close_thread_tables
 #include "sql/sql_class.h"  // THD
 #include "sql/table.h"      // TABLE
 
@@ -37,7 +38,7 @@
 #include "storage/rapid_engine/imcs/imcs.h"
 #include "storage/rapid_engine/include/rapid_config.h"  // shannon_rpd_engine_cfg
 #include "storage/rapid_engine/include/rapid_context.h"
-#include "storage/rapid_engine/recovery/load_persist.h"
+#include "storage/rapid_engine/recovery/recovery_load.h"
 #include "storage/rapid_engine/utils/utils.h"  // Util::open_table_by_name
 
 namespace ShannonBase {
@@ -62,6 +63,8 @@ RecoveryAdminSession::RecoveryAdminSession() {
 
 RecoveryAdminSession::~RecoveryAdminSession() {
   if (m_thd) {
+    if (m_thd->open_tables) close_thread_tables(m_thd);
+    m_thd->mdl_context.release_transactional_locks();
     m_thd->release_resources();
     delete m_thd;
     m_thd = nullptr;
@@ -93,19 +96,21 @@ bool RecoveryJob::execute() {
   // Skip if already present in IMCS
   {
     auto share = shannon_loaded_tables->get(info.schema_name, info.table_name);
-    table_id_t tid = share->m_tableid;
+    table_id_t tid = share ? share->m_tableid : 0;
     auto *imcs = ShannonBase::Imcs::Imcs::instance();
-    if (share->is_partitioned) {
-      if (imcs->get_rpd_parttable(tid)) {
-        DBUG_PRINT("recovery",
-                   ("RecoveryJob: skip %s.%s – already in IMCS", info.schema_name.c_str(), info.table_name.c_str()));
-        return true;
-      }
-    } else {
-      if (imcs->get_rpd_table(tid)) {
-        DBUG_PRINT("recovery",
-                   ("RecoveryJob: skip %s.%s - already in IMCS", info.schema_name.c_str(), info.table_name.c_str()));
-        return true;
+    if (share) {
+      if (share->is_partitioned) {
+        if (imcs->get_rpd_parttable(tid)) {
+          DBUG_PRINT("recovery",
+                     ("RecoveryJob: skip %s.%s - already in IMCS", info.schema_name.c_str(), info.table_name.c_str()));
+          return true;
+        }
+      } else {
+        if (imcs->get_rpd_table(tid)) {
+          DBUG_PRINT("recovery",
+                     ("RecoveryJob: skip %s.%s - already in IMCS", info.schema_name.c_str(), info.table_name.c_str()));
+          return true;
+        }
       }
     }
   }
@@ -304,7 +309,7 @@ void DDWorker::run() {
       // Non-fatal per design: errors during restart recovery are logged but
       // do not block normal system operation.
       LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG,
-             "DDWorker: query_loaded_tables returned error %d – skipping restart reload", ret);
+             "DDWorker: query_loaded_tables returned error %d - skipping restart reload", ret);
     }
   }
 
@@ -328,12 +333,12 @@ void RecoveryFramework::invalidate_external_global_state() {
   // to invalidate. This function exists as an extension point for future
   // integrations (e.g., Object Store recovery).
   LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
-         "RecoveryFramework: rapid_reload_on_restart=OFF – external state invalidated");
+         "RecoveryFramework: rapid_reload_on_restart=OFF - external state invalidated");
 }
 
 void RecoveryFramework::process_external_global_state() {
   if (!ShannonBase::shannon_rpd_engine_cfg.reload_on_restart) {
-    // Patch #4: If reload is disabled AND global state is empty, invalidate.
+    // If reload is disabled AND global state is empty, invalidate.
     if (m_global_state_empty.load()) {
       invalidate_external_global_state();
     }
@@ -344,7 +349,7 @@ void RecoveryFramework::process_external_global_state() {
   m_dd_worker = std::make_unique<DDWorker>();
   if (!m_dd_worker->start()) {
     LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
-           "RecoveryFramework: failed to start DDWorker – restart reload will not be performed");
+           "RecoveryFramework: failed to start DDWorker - restart reload will not be performed");
     m_dd_worker.reset();
   }
 }
@@ -397,7 +402,7 @@ void RecoveryFramework::startup() {
   if (!empty) {
     // Tables are already in memory (hot reload scenario, not a restart).
     LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
-           "RecoveryFramework: IMCS Global State is not empty – skipping restart recovery");
+           "RecoveryFramework: IMCS Global State is not empty - skipping restart recovery");
     return;
   }
 
@@ -410,36 +415,36 @@ void RecoveryFramework::startup() {
   // Spawn monitoring thread
   // The monitoring thread waits for DDWorker to complete its DD scan, then
   // dispatches reload jobs. This keeps startup() non-blocking.
-  std::thread([this]() {
-    while (!m_dd_worker->is_done()) {
+  m_monitoring_thread = std::thread([this]() {
+    while (m_dd_worker && !m_dd_worker->is_done()) {
       if (m_stopped.load(std::memory_order_acquire)) return;
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
-    if (!m_stopped.load(std::memory_order_acquire)) {
+    if (!m_stopped.load(std::memory_order_acquire) && m_dd_worker) {
       dispatch_jobs(m_dd_worker->found_tables());
     }
-  }).detach();
+  });
 }
 
 void RecoveryFramework::shutdown() {
   DBUG_TRACE;
 
   m_stopped.store(true, std::memory_order_release);
+  if (m_monitoring_thread.joinable()) m_monitoring_thread.join();
 
-  if (m_dd_worker) {
-    m_dd_worker->stop();
-    m_dd_worker.reset();
-  }
+  if (m_dd_worker) m_dd_worker->stop();
 
   {
     std::unique_lock<std::mutex> lk(m_jobs_mutex);
-    m_jobs_cv.wait_for(lk, std::chrono::seconds(60), [this] { return m_active_jobs.load() == 0; });
+    m_jobs_cv.wait_for(lk, std::chrono::seconds(5), [this] { return m_active_jobs.load() == 0; });
   }
+
+  if (m_dd_worker) m_dd_worker.reset();
 
   size_t total = m_reloaded_count.load();
   LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
-         "RecoveryFramework: shutdown complete – %zu table(s) reloaded this session", total);
+         "RecoveryFramework: shutdown complete - %zu table(s) reloaded this session", total);
 }
 }  // namespace Recovery
 }  // namespace ShannonBase

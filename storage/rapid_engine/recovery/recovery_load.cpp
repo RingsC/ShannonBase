@@ -24,7 +24,7 @@
    The fundmental code for imcs.
 */
 
-#include "storage/rapid_engine/recovery/load_persist.h"
+#include "storage/rapid_engine/recovery/recovery_load.h"
 
 #include <cctype>
 #include <unordered_map>
@@ -33,16 +33,47 @@
 #include "include/my_inttypes.h"
 #include "include/mysql/components/services/log_builtins.h"  // LogErr
 #include "mysql/strings/m_ctype.h"                           // system_charset_info
-#include "sql/handler.h"                                     // HA_ERR_*, handler::NONE, store_record()
-#include "sql/sql_class.h"                                   // THD
-#include "sql/table.h"                                       // TABLE, Field
+#include "sql/dd/dd_kill_immunizer.h"                        // dd::DD_kill_immunizer
+#include "sql/dd/impl/utils.h"
+#include "sql/handler.h"  // HA_ERR_*, handler::NONE, store_record()
+#include "sql/sql_base.h"
+#include "sql/sql_class.h"  // THD
+#include "sql/table.h"      // TABLE, Field
 
 #include "storage/rapid_engine/utils/utils.h"  // Util::open_table_by_name / close_table
-/**
- * implementation: secondary_load flag persistence.
- */
+
 namespace ShannonBase {
 namespace Recovery {
+// RAII guard: temporarily disable binlog for system table updates
+// When updating mysql.tables (a system/metadata table), we must disable binlog
+// recording because:
+//   1. metadata changes should not be replicated (they are schema-dependent)
+//   2. calling ha_update_row on system tables from certain contexts (e.g.,
+//      DROP DATABASE) can trigger binlog assert failures if binlog state is
+//      inconsistent.
+//
+// This guard saves THD::variables.option_bits, clears OPTION_BIN_LOG, and
+// restores the original value on destruction.
+class Binlog_guard {
+ public:
+  explicit Binlog_guard(THD *thd) : m_thd(thd) {
+    if (m_thd) {
+      m_saved_options = m_thd->variables.option_bits;
+      m_thd->variables.option_bits &= ~OPTION_BIN_LOG;
+    }
+  }
+
+  ~Binlog_guard() {
+    if (m_thd) m_thd->variables.option_bits = m_saved_options;
+  }
+
+  Binlog_guard(const Binlog_guard &) = delete;
+  Binlog_guard &operator=(const Binlog_guard &) = delete;
+
+ private:
+  THD *m_thd{nullptr};
+  ulonglong m_saved_options{0};
+};
 static constexpr uint kTablesSchemaId = 1;  // schema_id (FK → mysql.schemata.id)
 static constexpr uint kTablesName = 2;      // name      (table name)
 static constexpr uint kTablesOptions = 10;  // options   (key=value string)
@@ -120,8 +151,7 @@ static int build_schema_id_map(THD *thd, std::unordered_map<longlong, std::strin
 
   TABLE *schemata = ShannonBase::Utils::Util::open_table_by_name(thd, "mysql", "schemata", TL_READ_WITH_SHARED_LOCKS);
   if (!schemata) {
-    // open_table_by_name already emits a warning.
-    ShannonBase::Utils::Util::close_table(thd, schemata);
+    // open_table_by_name already emits a warning; do NOT call close_table(null).
     LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG, "rapid_load_persist: cannot open mysql.schemata");
     return HA_ERR_GENERIC;
   }
@@ -131,19 +161,24 @@ static int build_schema_id_map(THD *thd, std::unordered_map<longlong, std::strin
     return HA_ERR_GENERIC;
   }
 
-  ShannonBase::Utils::ColumnMapGuard guard(schemata, ShannonBase::Utils::ColumnMapGuard::TYPE::READ);
+  // Scope the guard so its destructor runs BEFORE ha_rnd_end / close_table.
+  // Without this scope, the guard's dtor would fire at function-exit, after
+  // the table has already been freed, causing the SIGSEGV in close_thread_tables.
+  {
+    ShannonBase::Utils::ColumnMapGuard guard(schemata, ShannonBase::Utils::ColumnMapGuard::TYPE::READ);
 
-  int tmp;
-  while ((tmp = schemata->file->ha_rnd_next(schemata->record[0])) != HA_ERR_END_OF_FILE) {
-    if (tmp == HA_ERR_KEY_NOT_FOUND) break;
+    int tmp;
+    while ((tmp = schemata->file->ha_rnd_next(schemata->record[0])) != HA_ERR_END_OF_FILE) {
+      if (tmp == HA_ERR_KEY_NOT_FOUND) break;
 
-    longlong id = (*(schemata->field + kSchemataId))->val_int();
+      longlong id = (*(schemata->field + kSchemataId))->val_int();
 
-    String buf;
-    std::string name = (*(schemata->field + kSchemataName))->val_str(&buf)->c_ptr();
+      String buf;
+      std::string name = (*(schemata->field + kSchemataName))->val_str(&buf)->c_ptr();
 
-    out.emplace(id, std::move(name));
-  }
+      out.emplace(id, std::move(name));
+    }
+  }  // ~ColumnMapGuard: bitmaps restored here, while TABLE is still alive
 
   schemata->file->ha_rnd_end();
   ShannonBase::Utils::Util::close_table(thd, schemata);
@@ -183,45 +218,52 @@ int LoadFlagManager::set_flag(THD *thd, const std::string &schema_name, const st
   }
 
   // TYPE::ALL populates both read_set and write_set – required for ha_update_row.
-  ShannonBase::Utils::ColumnMapGuard guard(cat, ShannonBase::Utils::ColumnMapGuard::TYPE::ALL);
-
-  int tmp;
+  // Scope the guard so its destructor runs BEFORE ha_rnd_end / close_table.
   int ret = HA_ERR_GENERIC;  // updated to 0 on success
+  {
+    ShannonBase::Utils::ColumnMapGuard guard(cat, ShannonBase::Utils::ColumnMapGuard::TYPE::ALL);
 
-  while ((tmp = cat->file->ha_rnd_next(cat->record[0])) != HA_ERR_END_OF_FILE) {
-    if (tmp == HA_ERR_KEY_NOT_FOUND) break;
+    int tmp;
 
-    // Filter by schema_id
-    longlong row_sch_id = (*(cat->field + kTablesSchemaId))->val_int();
-    if (row_sch_id != target_schema_id) continue;
+    while ((tmp = cat->file->ha_rnd_next(cat->record[0])) != HA_ERR_END_OF_FILE) {
+      if (tmp == HA_ERR_KEY_NOT_FOUND) break;
 
-    // Filter by table name
-    String name_buf;
-    std::string row_name = (*(cat->field + kTablesName))->val_str(&name_buf)->c_ptr();
-    if (row_name != table_name) continue;
+      // Filter by schema_id
+      longlong row_sch_id = (*(cat->field + kTablesSchemaId))->val_int();
+      if (row_sch_id != target_schema_id) continue;
 
-    String opt_buf;
-    std::string current_opts = (*(cat->field + kTablesOptions))->val_str(&opt_buf)->c_ptr();
-    std::string new_opts = rebuild_options(current_opts, loaded);
+      // Filter by table name
+      String name_buf;
+      std::string row_name = (*(cat->field + kTablesName))->val_str(&name_buf)->c_ptr();
+      if (row_name != table_name) continue;
 
-    // store_record copies record[0] → record[1] (old image).
-    store_record(cat, record[1]);
+      String opt_buf;
+      std::string current_opts = (*(cat->field + kTablesOptions))->val_str(&opt_buf)->c_ptr();
+      std::string new_opts = rebuild_options(current_opts, loaded);
 
-    Field *opt_fld = *(cat->field + kTablesOptions);
-    opt_fld->store(new_opts.c_str(), new_opts.length(), system_charset_info);
+      // store_record copies record[0] → record[1] (old image).
+      store_record(cat, record[1]);
 
-    // record[1] = old, record[0] = new.
-    int err = cat->file->ha_update_row(cat->record[1], cat->record[0]);
-    if (err == 0 || err == HA_ERR_RECORD_IS_THE_SAME) {
-      ret = 0;
-      DBUG_PRINT("recovery", ("set_flag: options updated '%s' → '%s' for %s.%s", current_opts.c_str(), new_opts.c_str(),
-                              schema_name.c_str(), table_name.c_str()));
-    } else {
-      LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG, "LoadFlagManager::set_flag: ha_update_row error %d for %s.%s", err,
-             schema_name.c_str(), table_name.c_str());
+      Field *opt_fld = *(cat->field + kTablesOptions);
+      opt_fld->store(new_opts.c_str(), new_opts.length(), system_charset_info);
+
+      // record[1] = old, record[0] = new.
+      int err{0};
+      {
+        Binlog_guard no_binlog(thd);
+        err = cat->file->ha_update_row(cat->record[1], cat->record[0]);
+      }
+      if (err == 0 || err == HA_ERR_RECORD_IS_THE_SAME) {
+        ret = 0;
+        DBUG_PRINT("recovery", ("set_flag: options updated '%s' → '%s' for %s.%s", current_opts.c_str(),
+                                new_opts.c_str(), schema_name.c_str(), table_name.c_str()));
+      } else {
+        LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG, "LoadFlagManager::set_flag: ha_update_row error %d for %s.%s", err,
+               schema_name.c_str(), table_name.c_str());
+      }
+      break;  // (schema_id, table_name) is unique in mysql.tables
     }
-    break;  // (schema_id, table_name) is unique in mysql.tables
-  }
+  }  // ~ColumnMapGuard: bitmaps restored here, while TABLE is still alive
 
   cat->file->ha_rnd_end();
   ShannonBase::Utils::Util::close_table(thd, cat);
@@ -237,6 +279,8 @@ int LoadFlagManager::query_loaded_tables(THD *thd, std::vector<SecondaryLoadedTa
   DBUG_TRACE;
   out.clear();
 
+  const dd::DD_kill_immunizer m_kill_immunizer(thd);
+
   std::unordered_map<longlong, std::string> schema_map;
   if (int r = build_schema_id_map(thd, schema_map); r != 0) return r;
 
@@ -251,38 +295,41 @@ int LoadFlagManager::query_loaded_tables(THD *thd, std::vector<SecondaryLoadedTa
     return HA_ERR_GENERIC;
   }
 
-  ShannonBase::Utils::ColumnMapGuard guard(cat, ShannonBase::Utils::ColumnMapGuard::TYPE::READ);
+  // Scope the guard so its destructor runs BEFORE ha_rnd_end / close_table.
+  {
+    ShannonBase::Utils::ColumnMapGuard guard(cat, ShannonBase::Utils::ColumnMapGuard::TYPE::READ);
 
-  int tmp;
-  while ((tmp = cat->file->ha_rnd_next(cat->record[0])) != HA_ERR_END_OF_FILE) {
-    if (tmp == HA_ERR_KEY_NOT_FOUND) break;
+    int tmp;
+    while ((tmp = cat->file->ha_rnd_next(cat->record[0])) != HA_ERR_END_OF_FILE) {
+      if (tmp == HA_ERR_KEY_NOT_FOUND) break;
 
-    longlong sch_id = (*(cat->field + kTablesSchemaId))->val_int();
-    auto it = schema_map.find(sch_id);
-    if (it == schema_map.end()) continue;
-    if (is_system_schema(it->second)) continue;
+      longlong sch_id = (*(cat->field + kTablesSchemaId))->val_int();
+      auto it = schema_map.find(sch_id);
+      if (it == schema_map.end()) continue;
+      if (is_system_schema(it->second)) continue;
 
-    String name_buf;
-    std::string table_name = (*(cat->field + kTablesName))->val_str(&name_buf)->c_ptr();
+      String name_buf;
+      std::string table_name = (*(cat->field + kTablesName))->val_str(&name_buf)->c_ptr();
 
-    String opt_buf;
-    std::string opts = (*(cat->field + kTablesOptions))->val_str(&opt_buf)->c_ptr();
+      String opt_buf;
+      std::string opts = (*(cat->field + kTablesOptions))->val_str(&opt_buf)->c_ptr();
 
-    if (!has_secondary_load_flag(opts)) continue;
+      if (!has_secondary_load_flag(opts)) continue;
 
-    SecondaryLoadedTable entry;
-    entry.schema_name = it->second;
-    entry.table_name = table_name;
-    // Detect partitioned tables: check the options string for "partitioned"
-    // keyword, exactly as load_mysql_tables_info does.
-    entry.is_partitioned =
-        (opts.find("partitioned") != std::string::npos || opts.find("PARTITIONED") != std::string::npos);
+      SecondaryLoadedTable entry;
+      entry.schema_name = it->second;
+      entry.table_name = table_name;
+      // Detect partitioned tables: check the options string for "partitioned"
+      // keyword, exactly as load_mysql_tables_info does.
+      entry.is_partitioned =
+          (opts.find("partitioned") != std::string::npos || opts.find("PARTITIONED") != std::string::npos);
 
-    DBUG_PRINT("recovery", ("query_loaded_tables: found %s.%s (partitioned=%d)", entry.schema_name.c_str(),
-                            entry.table_name.c_str(), entry.is_partitioned ? 1 : 0));
+      DBUG_PRINT("recovery", ("query_loaded_tables: found %s.%s (partitioned=%d)", entry.schema_name.c_str(),
+                              entry.table_name.c_str(), entry.is_partitioned ? 1 : 0));
 
-    out.push_back(std::move(entry));
-  }
+      out.push_back(std::move(entry));
+    }
+  }  // ~ColumnMapGuard: bitmaps restored here, while TABLE is still alive
 
   cat->file->ha_rnd_end();
   ShannonBase::Utils::Util::close_table(thd, cat);

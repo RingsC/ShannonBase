@@ -221,25 +221,28 @@ int Utils::check_table_available(std::string &sch_tb_name) {
 }
 
 // open table by name. return table ptr, otherwise return nullptr.
-TABLE *Utils::open_table_by_name(const std::string &schema_name, const std::string &table_name, thr_lock_type) {
+TABLE *Utils::open_table_by_name(const std::string &schema_name, const std::string &table_name, thr_lock_type lk_mode) {
   THD *thd = current_thd;
   /**
    * due to in function, `select xxxx`, when the statment executed, it enter lock table mode
    * but there's not even a opened table, so that, here we try to open a table, it failed before
    * exiting the lock table mode. such as executing `selecct ml_predict_row(xxx) int xx;`
    */
+  const bool is_write = (lk_mode >= TL_WRITE_ALLOW_WRITE);
+  const enum_mdl_type mdl_type = is_write ? MDL_SHARED_WRITE : MDL_SHARED_READ;
+
   Table_ref table_list;
   table_list.db = schema_name.c_str();
   table_list.db_length = schema_name.length();
   table_list.table_name = table_name.c_str();
   table_list.table_name_length = table_name.length();
   table_list.alias = table_name.c_str();
-  table_list.set_lock({TL_READ, THR_DEFAULT});
+  table_list.set_lock({lk_mode, THR_DEFAULT});
   MDL_REQUEST_INIT(&table_list.mdl_request,
                    MDL_key::TABLE,       // namespace
                    schema_name.c_str(),  // db
                    table_name.c_str(),   // name
-                   MDL_SHARED_READ,      // type
+                   mdl_type,             // type
                    MDL_TRANSACTION);     // duration
 
   Table_ref *table_list_ptr = &table_list;
