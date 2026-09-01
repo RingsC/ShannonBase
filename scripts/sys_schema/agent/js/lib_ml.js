@@ -178,7 +178,7 @@ function build_task_header(intent) {
     return t('这是一个机器学习任务。请先确认数据表结构和目标列。\n'
              + '⚠️ 训练前必须确保表已通过 ALTER TABLE db.table SECONDARY_LOAD 加载到 RAPID 引擎。\n'
              + '   先用 check_secondary_load 检查表是否已加载，\n'
-             + '   若未加载，告知用户需要先执行 SECONDARY_LOAD 后再重试。\n'
+             + '   若未加载，用 run_ddl 执行 ALTER TABLE db.table SECONDARY_LOAD 完成加载后继续。\n'
              + '步骤：1) describe_table 确认列结构\n'
              + '      2) check_secondary_load 检查是否已 SECONDARY_LOAD\n'
              + '      3) ml_train 训练模型（model_handle 为模型名称如 census_model）\n'
@@ -188,7 +188,7 @@ function build_task_header(intent) {
              'This is an ML task. First inspect the table structure and target column.\n'
              + '⚠️ Before training, verify the table is loaded into RAPID via ALTER TABLE db.table SECONDARY_LOAD.\n'
              + '   Use check_secondary_load to verify if the table is loaded.\n'
-             + '   If not loaded, tell the user to execute SECONDARY_LOAD first and retry.\n'
+             + '   If not loaded, run ALTER TABLE db.table SECONDARY_LOAD via run_ddl, then continue.\n'
              + 'Steps: 1) describe_table to confirm column structure\n'
              + '       2) check_secondary_load to verify SECONDARY_LOAD status\n'
              + '       3) ml_train to train the model (model_handle is the model name, e.g. census_model)\n'
@@ -279,12 +279,32 @@ function ml_rag(question, topK, opt_override) {
   var raw = String(rows[0].result);
   try {
     var obj = JSON.parse(raw);
+    /* ML_RAG reports what it retrieved as `citations` plus a
+     * `processing_info` block -- it has never emitted `found`, `hit_count` or
+     * `n_citations`.  Reading only those three meant hits was always 0 and
+     * heatwave_dispatch scored every successful retrieval as a miss, then
+     * threw the citations away and answered from the bare model instead.
+     * Prefer the real fields and keep the old names as fallbacks. */
+    var info = (obj.processing_info && typeof obj.processing_info === 'object')
+      ? obj.processing_info : {};
+    var citation_list = Array.isArray(obj.citations) ? obj.citations : [];
+    var hits = Number(
+      info.citations_returned !== undefined    ? info.citations_returned :
+      info.total_citations_found !== undefined ? info.total_citations_found :
+      obj.hit_count !== undefined              ? obj.hit_count :
+      obj.n_citations !== undefined            ? obj.n_citations :
+                                                 citation_list.length
+    );
+    if (!isFinite(hits)) hits = citation_list.length;
     return {
       text: String(obj.text || raw),
       ok: true,
       raw: raw,
-      found: obj.found || obj.hit_count || obj.n_citations || false,
-      hits: obj.hit_count || obj.n_citations || 0,
+      found: (obj.found === true) || hits > 0,
+      hits: hits,
+      citations: citation_list,
+      /* skip_generate mode returns retrieved context, not a written answer. */
+      retrieved_only: !!(opt && opt.skip_generate),
       score: obj.score || 0
     };
   } catch(e) {

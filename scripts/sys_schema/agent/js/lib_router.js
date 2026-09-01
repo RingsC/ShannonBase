@@ -95,6 +95,22 @@ function heatwave_dispatch(user_msg, chat_opt, vector_tables) {
                    );
 
   if (rag_success) {
+    /* skip_generate (the default) makes ML_RAG return the retrieved segments
+     * themselves rather than a written answer, so handing rag_text straight
+     * back is a context dump, not a reply.  Compose the answer from that
+     * context, grounded and with no licence to invent beyond it. */
+    if (rag_res.retrieved_only) {
+      var grounded = ml_generate(
+        (hist_ctx ? hist_ctx + '\n\n' : '') +
+        t('请只依据以下知识库检索结果回答问题；若检索结果不足以回答，请直接说明，不要编造。\n【检索结果】\n',
+          'Answer the question using only the knowledge-base excerpts below. If they are not enough, say so plainly rather than inventing an answer.\n[Retrieved context]\n') +
+        compress(rag_text, cfg('plan_log_max_tokens', 4000)) + '\n\n' +
+        u_pre + user_msg + a_suf,
+        chat_opt.model_options || {});
+      if (grounded && grounded.trim().length > 0)
+        return { mode: 'RAG', response: grounded.trim(),
+                 tables: vector_tables, rag_meta: rag_res };
+    }
     return { mode: 'RAG', response: rag_text, tables: vector_tables, rag_meta: rag_res };
   }
 
@@ -281,7 +297,13 @@ function build_system_prompt(db, schema_ctx, join_hint, plan_hint,
     'Q: 导出模型 iris_model\n' +
     'A: {"thought":"导出训练好的模型","tool":"ml_model_export","args":{"model_handle":"iris_model","output_table":"ml_data.iris_export"}}\n\n' +
     'Q: 有哪些已训练的模型？\n' +
-    'A: {"thought":"列出当前用户的所有模型","tool":"ml_list_models","args":{}}\n';
+    'A: {"thought":"列出当前用户的所有模型","tool":"ml_list_models","args":{}}\n\n' +
+    'Q: 给 orders 表的 status 列建一个索引 idx_status\n' +
+    'A: {"thought":"结构变更用 run_ddl，不要说自己没有执行 DDL 的能力","tool":"run_ddl","args":{"sql":"CREATE INDEX idx_status ON orders (status)"}}\n\n' +
+    'Q: 把 shop.orders 加载到 RAPID 引擎\n' +
+    'A: {"thought":"先启用二级引擎","tool":"run_ddl","args":{"sql":"ALTER TABLE shop.orders SECONDARY_ENGINE = RAPID"}}\n' +
+    '   （成功后，下一轮再加载）\n' +
+    '   {"thought":"加载到 RAPID","tool":"run_ddl","args":{"sql":"ALTER TABLE shop.orders SECONDARY_LOAD"}}\n';
 
   var en_examples =
     '[Few-Shot Examples (required format)]\n' +
@@ -326,7 +348,13 @@ function build_system_prompt(db, schema_ctx, join_hint, plan_hint,
     'Q: Export model iris_model\n' +
     'A: {"thought":"Export the trained model","tool":"ml_model_export","args":{"model_handle":"iris_model","output_table":"ml_data.iris_export"}}\n\n' +
     'Q: What trained models are available?\n' +
-    'A: {"thought":"List all models for the current user","tool":"ml_list_models","args":{}}\n';
+    'A: {"thought":"List all models for the current user","tool":"ml_list_models","args":{}}\n\n' +
+    'Q: Add an index idx_status on the status column of orders\n' +
+    'A: {"thought":"Schema changes go through run_ddl — never claim you cannot execute DDL","tool":"run_ddl","args":{"sql":"CREATE INDEX idx_status ON orders (status)"}}\n\n' +
+    'Q: Load shop.orders into the RAPID engine\n' +
+    'A: {"thought":"Enable the secondary engine first","tool":"run_ddl","args":{"sql":"ALTER TABLE shop.orders SECONDARY_ENGINE = RAPID"}}\n' +
+    '   (after it succeeds, next turn)\n' +
+    '   {"thought":"Now load it","tool":"run_ddl","args":{"sql":"ALTER TABLE shop.orders SECONDARY_LOAD"}}\n';
 
   var inline_few_shot = t(zh_examples, en_examples);
 
@@ -342,7 +370,8 @@ function build_system_prompt(db, schema_ctx, join_hint, plan_hint,
       '【可用工具】每次只输出一个合法 JSON，禁止在 JSON 前后添加任何文字：\n' +
       '1. {"thought":"...","tool":"query_db","args":{"sql":"SELECT ..."}}\n' +
       '   → 执行单条只读 SQL（SELECT/SHOW/DESC/EXPLAIN/WITH）\n' +
-      '   → 若开启 review 模式，读操作可直接执行；写操作会先生成审批步骤并等待确认；DDL 当前直接拒绝执行\n' +
+      '   → 若开启 review 模式，读操作可直接执行；写操作与 DDL 会先生成审批步骤并等待确认。' +
+      'DDL 请使用 run_ddl 工具，不要放进 query_db / update_data\n' +
       '2. {"thought":"...","tool":"explain_sql","args":{"sql":"SELECT ..."}}\n' +
       '   → 分析执行计划，⚠ 结果中出现全表扫描时必须先改写 SQL\n' +
       '3. {"thought":"...","tool":"plan_sql","args":{"steps":[{"sql":"...","desc":"..."},...]}}\n' +
@@ -350,6 +379,9 @@ function build_system_prompt(db, schema_ctx, join_hint, plan_hint,
       '   → 适用：需要先 SHOW TABLES 再 SHOW CREATE、先探查结构再聚合等场景\n' +
       '4. {"thought":"...","tool":"begin_tx","args":{}}\n' +
       '   → 若 CALL shannon_chat() 的调用者已 START TRANSACTION，则复用 caller transaction，不再 START；Agent 无权提交/回滚 caller transaction\n' +
+      '   ⚠ 若 begin_tx 报错“不允许在存储函数内开启事务”，说明本次是经由存储函数入口调用的，' +
+      '该入口无法自持事务。此时不要重试 begin_tx，直接告知用户：请先在会话中执行 ' +
+      'START TRANSACTION 再重新发起写请求，并由其自行 COMMIT / ROLLBACK。\n' +
       '5. {"thought":"...","tool":"update_data","args":{"sql":"INSERT/UPDATE/DELETE ..."}}\n' +
       '6. {"thought":"...","tool":"commit_tx","args":{}}\n' +
       '7. {"thought":"...","tool":"rollback_tx","args":{}}\n' +
@@ -362,6 +394,14 @@ function build_system_prompt(db, schema_ctx, join_hint, plan_hint,
       '   → 获取单张表（或 table_names 数组，最多5张）完整列定义 + 关联的 FOREIGN KEY\n' +
       '   → 在为陌生表写 SQL 之前，必须先用这个工具确认列名，禁止凭猜测\n' +
       '11. {"thought":"...","tool":"generate_text","args":{"prompt":"..."}}\n\n' +
+      '11c. {"thought":"...","tool":"run_ddl","args":{"sql":"ALTER TABLE db.t SECONDARY_LOAD"}}\n' +
+      '   → 【DDL】执行 CREATE / ALTER / RENAME 等结构变更，典型用途：\n' +
+      '     ALTER TABLE db.t SECONDARY_LOAD（把表加载进 RAPID，ml_train 的前置条件）、\n' +
+      '     ALTER TABLE db.t SECONDARY_UNLOAD、CREATE INDEX / ALTER TABLE ADD COLUMN\n' +
+      '   → DDL 会隐式提交事务：若当前存在活跃事务会被拒绝，需先 COMMIT/ROLLBACK 再执行\n' +
+      '   → DROP / TRUNCATE 等破坏性语句由系统策略控制，默认拒绝。是否允许由系统判定，' +
+      '不要自行查询 @chat_options 来推断：直接发起 run_ddl 调用，若被策略拒绝会返回明确错误，' +
+      '再把该错误原文转达用户即可\n\n' +
       '【ML/AutoML 工具】机器学习全生命周期，model_handle 为模型名称（字符串）。\n' +
       '  可通过 @chat_options.handle_model 预设模型句柄，后续调用 ml_train/ml_predict 等工具时可省略 model_handle 参数。\n' +
       '11b. {"thought":"...","tool":"check_secondary_load","args":{"table_name":"db.table"}}\n' +
@@ -389,7 +429,22 @@ function build_system_prompt(db, schema_ctx, join_hint, plan_hint,
       '20. {"thought":"...","tool":"ml_model_import","args":{"model_handle":"new_model","model_content":"db.exported","task":"classification"}}\n' +
       '   → 导入已导出的模型，model_content 为 export 的表名\n' +
       '21. {"thought":"...","tool":"ml_list_models","args":{}}\n' +
-      '   → 列出当前用户所有已训练模型\n\n' +
+      '   → 列出当前用户所有已训练模型（磁盘上的模型目录）\n' +
+      '22. {"thought":"...","tool":"ml_model_load","args":{"model_handle":"my_model"}}\n' +
+      '   → 将模型加载到内存。ml_predict_* / ml_explain_* 依赖已加载的模型；\n' +
+      '     若预测报错提示模型未加载，先调用本工具再重试\n' +
+      '23. {"thought":"...","tool":"ml_model_unload","args":{"model_handle":"my_model"}}\n' +
+      '   → 将模型从内存卸载，释放内存\n' +
+      '24. {"thought":"...","tool":"ml_model_active","args":{"user":"current"}}\n' +
+      '   → 查看当前内存中已加载的模型及占用内存。user 可为 current（默认）或 all\n' +
+      '25. {"thought":"...","tool":"ml_embed_table","args":{"input_column":"db.docs.content","output_column":"db.docs.segment_embedding"}}\n' +
+      '   → 【批量向量化】把一列文本编码为向量写入另一列，这是构建 RAG 知识库（向量库）的入口\n' +
+      '   → 可选 args.options：{"model_id":"...","batch_size":500,"truncate":true}\n' +
+      '26. {"thought":"...","tool":"ml_generate_table","args":{"input_column":"db.t.prompt","output_column":"db.t.answer"}}\n' +
+      '   → 【批量生成】对整列文本批量调用 LLM（如批量摘要/分类/改写）\n' +
+      '   → 可选 args.options：{"task":"summarization","model_id":"...","context_column":"..."}\n' +
+      '27. {"thought":"...","tool":"ml_rag_table","args":{"input_column":"db.q.question","output_column":"db.q.answer"}}\n' +
+      '   → 【批量 RAG】对整列问题批量检索知识库并生成回答\n\n' +
       '【args 严格约束 - 违反视为错误】\n' +
       '  ① query_db / explain_sql / update_data：args.sql 必须是完整可执行 SQL，禁止为空或省略\n' +
       '  ② plan_sql：args.steps 必须是非空数组，每个元素含 sql 字段\n' +
@@ -399,10 +454,19 @@ function build_system_prompt(db, schema_ctx, join_hint, plan_hint,
       '  ⑥ 不确定 SQL 时：先用 list_tables/describe_table 或 query_db/plan_sql 探查 schema，再构造目标 SQL\n' +
       '  ⑦ 除 ④⑤ 列出的工具外，禁止输出 {"tool":"query_db","args":{}} 这类空 args\n' +
       '  ⑧ ml_train：table_name 必须是 db.table 格式；task 为 classification|regression|forecasting|anomaly_detection|recommendation；\n' +
-      '     调用前必须先用 check_secondary_load 确认表已 SECONDARY_LOAD，未加载则告知用户而非自动执行\n' +
+      '     调用前必须先用 check_secondary_load 确认表已 SECONDARY_LOAD；若未加载，' +
+      '直接用 run_ddl 执行 ALTER TABLE db.t SECONDARY_LOAD 完成加载后再训练，无需要求用户手工执行\n' +
       '  ⑨ ml_predict_row：data 必须是 JSON 对象（列名→值），不是数组\n' +
       '  ⑩ ml_score：metric 必须是 accuracy|balanced_accuracy|f1|precision|recall|roc_auc|neg_log_loss 之一\n' +
-      '  ⑪ ml_model_import：model_content 必须是之前 ml_model_export 导出的表名\n\n' +
+      '  ⑪ ml_model_import：model_content 必须是之前 ml_model_export 导出的表名\n' +
+      '  ⑫ ml_embed_table / ml_generate_table / ml_rag_table：input_column 与 output_column\n' +
+      '     必须是三段式 DBName.TableName.ColumnName（不是表名）；input_column 必须已存在，\n' +
+      '     而 output_column 必须尚不存在 —— 该列由例程自动 ADD COLUMN 创建，若已存在会直接报错。\n' +
+      '     调用前先用 describe_table 确认输入列存在、输出列不存在；表必须有主键。\n' +
+      '     ⚠ 这三个工具直接在 InnoDB 表上运行，不需要 SECONDARY_LOAD —— 上面 ⑧ 的\n' +
+      '     SECONDARY_LOAD 前置条件只适用于 ml_train，不要套用到这里而拒绝执行\n' +
+      '  ⑬ ml_model_load / ml_model_unload：model_handle 可省略（则使用\n' +
+      '     @chat_options.handle_model）；ml_model_active 的 user 只能是 current 或 all\n\n' +
       '【关键约束】写 SQL 时列名/表名必须来自上方 DDL 或工具返回的真实结果，禁止凭空编造；' +
       '若目标表只出现在【其他表】名称列表中（无完整列定义）或完全没有出现在上方 schema 中，' +
       '禁止直接猜测其列名生成 SQL —— 必须先用 describe_table 获取真实列定义' +
@@ -444,6 +508,10 @@ function build_system_prompt(db, schema_ctx, join_hint, plan_hint,
       '   → Use for: SHOW TABLES then inspect columns, check schema then aggregate, etc.\n' +
       '4. {"thought":"...","tool":"begin_tx","args":{}}\n' +
       '   → 若 CALL shannon_chat() 的调用者已 START TRANSACTION，则复用 caller transaction，不再 START；Agent 无权提交/回滚 caller transaction\n' +
+      '   ⚠ If begin_tx reports that transactions are not allowed inside a stored function, this ' +
+      'invocation came through the stored-function entry point, which cannot own one. Do not retry ' +
+      'begin_tx — tell the user to run START TRANSACTION in their session, reissue the write, and ' +
+      'COMMIT / ROLLBACK it themselves.\n' +
       '5. {"thought":"...","tool":"update_data","args":{"sql":"INSERT/UPDATE/DELETE ..."}}\n' +
       '6. {"thought":"...","tool":"commit_tx","args":{}}\n' +
       '7. {"thought":"...","tool":"rollback_tx","args":{}}\n' +
@@ -457,6 +525,14 @@ function build_system_prompt(db, schema_ctx, join_hint, plan_hint,
       '   → Get full column definitions (+ related FOREIGN KEYs) for one table, or up to 5 via table_names array\n' +
       '   → Always call this before writing SQL against an unfamiliar table — never guess column names\n' +
       '11. {"thought":"...","tool":"generate_text","args":{"prompt":"..."}}\n\n' +
+      '11c. {"thought":"...","tool":"run_ddl","args":{"sql":"ALTER TABLE db.t SECONDARY_LOAD"}}\n' +
+      '   → [DDL] Run CREATE / ALTER / RENAME schema changes. Typical uses:\n' +
+      '     ALTER TABLE db.t SECONDARY_LOAD (loads the table into RAPID — a prerequisite of ml_train),\n' +
+      '     ALTER TABLE db.t SECONDARY_UNLOAD, CREATE INDEX, ALTER TABLE ADD COLUMN\n' +
+      '   → DDL implicitly commits: it is refused while a transaction is open, so COMMIT/ROLLBACK first\n' +
+      '   → DROP / TRUNCATE are governed by system policy and refused by default. Do not try to ' +
+      'read @chat_options to work out whether they are allowed — just issue the run_ddl call; if ' +
+      'policy refuses it you get a clear error to relay to the user\n\n' +
       '[ML/AutoML Tools] Full ML lifecycle — model_handle must refer to a previously trained model:\n' +
       '12. {"thought":"...","tool":"ml_train","args":{"table_name":"db.table","target_column":"label","task":"regression","model_handle":"my_model"}}\n' +
       '   → Train an ML model. task defaults to classification, model_handle is optional (auto-generated)\n' +
@@ -477,7 +553,23 @@ function build_system_prompt(db, schema_ctx, join_hint, plan_hint,
       '20. {"thought":"...","tool":"ml_model_import","args":{"model_handle":"new_model","model_content":"db.exported","task":"classification"}}\n' +
       '   → Import a previously exported model — model_content is the export table name\n' +
       '21. {"thought":"...","tool":"ml_list_models","args":{}}\n' +
-      '   → List all trained models for the current user\n\n' +
+      '   → List all trained models for the current user (the on-disk model catalog)\n' +
+      '22. {"thought":"...","tool":"ml_model_load","args":{"model_handle":"my_model"}}\n' +
+      '   → Load a model into memory. ml_predict_* / ml_explain_* need a loaded model;\n' +
+      '     if a prediction fails saying the model is not loaded, call this first and retry\n' +
+      '23. {"thought":"...","tool":"ml_model_unload","args":{"model_handle":"my_model"}}\n' +
+      '   → Unload a model from memory to reclaim it\n' +
+      '24. {"thought":"...","tool":"ml_model_active","args":{"user":"current"}}\n' +
+      '   → Show which models are resident in memory and how much they use. user: current (default) or all\n' +
+      '25. {"thought":"...","tool":"ml_embed_table","args":{"input_column":"db.docs.content","output_column":"db.docs.segment_embedding"}}\n' +
+      '   → [Batch embedding] Encode a text column into vectors in another column — this is how a RAG\n' +
+      '     knowledge base (vector store) gets built\n' +
+      '   → Optional args.options: {"model_id":"...","batch_size":500,"truncate":true}\n' +
+      '26. {"thought":"...","tool":"ml_generate_table","args":{"input_column":"db.t.prompt","output_column":"db.t.answer"}}\n' +
+      '   → [Batch generation] Run the LLM over a whole column (bulk summarize / classify / rewrite)\n' +
+      '   → Optional args.options: {"task":"summarization","model_id":"...","context_column":"..."}\n' +
+      '27. {"thought":"...","tool":"ml_rag_table","args":{"input_column":"db.q.question","output_column":"db.q.answer"}}\n' +
+      '   → [Batch RAG] Answer a whole column of questions against the knowledge base\n\n' +
       '[args Strict Constraints – violations are errors]\n' +
       '  ① query_db / explain_sql / update_data: args.sql must be a complete executable SQL; cannot be empty\n' +
       '  ② plan_sql: args.steps must be a non-empty array; each element must have a sql field\n' +
@@ -486,10 +578,20 @@ function build_system_prompt(db, schema_ctx, join_hint, plan_hint,
       '  ⑤ list_tables: args.keyword is optional; without it, all tables are listed (large schemas are truncated)\n' +
       '  ⑥ When SQL is uncertain: use list_tables/describe_table or query_db/plan_sql to explore schema first\n' +
       '  ⑦ Outside of the tools listed in ④⑤, {"tool":"query_db","args":{}} style empty args are forbidden\n' +
-      '  ⑧ ml_train: table_name must be db.table format; task: classification|regression|forecasting|anomaly_detection|recommendation\n' +
+      '  ⑧ ml_train: table_name must be db.table format; task: classification|regression|forecasting|anomaly_detection|recommendation.\n' +
+      '     Confirm with check_secondary_load first; if the table is not loaded, run\n' +
+      '     ALTER TABLE db.t SECONDARY_LOAD yourself via run_ddl rather than asking the user to do it\n' +
       '  ⑨ ml_predict_row: data must be a JSON object (column→value), not an array\n' +
       '  ⑩ ml_score: metric must be one of accuracy|balanced_accuracy|f1|precision|recall|roc_auc|neg_log_loss\n' +
-      '  ⑪ ml_model_import: model_content must be the table name from a prior ml_model_export\n\n' +
+      '  ⑪ ml_model_import: model_content must be the table name from a prior ml_model_export\n' +
+      '  ⑫ ml_embed_table / ml_generate_table / ml_rag_table: input_column and output_column must be\n' +
+      '     three-part DBName.TableName.ColumnName references (not table names). input_column must\n' +
+      '     already exist; output_column must NOT — the routine ADDs that column itself and errors out\n' +
+      '     if it is already there. Confirm both with describe_table first; the table needs a primary key.\n' +
+      '     ⚠ These three run directly on InnoDB tables and do NOT require SECONDARY_LOAD — that\n' +
+      '     prerequisite in ⑧ applies to ml_train only; do not apply it here and refuse to run\n' +
+      '  ⑬ ml_model_load / ml_model_unload: model_handle may be omitted (falls back to\n' +
+      '     @chat_options.handle_model); ml_model_active user must be current or all\n\n' +
       '[Key Constraints] Column/table names used in SQL must come from the DDL above or from actual tool ' +
       'results — never invent them; if the target table only appears in the [Other tables] name list ' +
       '(no full column definitions) or does not appear above at all, do NOT guess its columns — first call ' +

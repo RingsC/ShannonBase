@@ -369,6 +369,22 @@ function shannon_agent_run(user_message, conversation_id) {
       break;
     }
 
+    /* The loop can exit with agent_response still holding a tool-call JSON:
+     * on the last allowed turn the branches above append the "now answer
+     * directly, no more JSON" instruction and `continue`, but the loop
+     * condition then ends the loop before that instruction is ever sent.
+     * The describe_table branch can also break out on malformed args while
+     * agent_response is the JSON.  Either way the raw JSON would be handed
+     * straight to the user, so spend the already-prepared prompt on one
+     * final generation instead. */
+    if (parse_tool_call(agent_response)) {
+      var rule_final = ml_generate(rule_summary_prompt,
+                                   { temperature: 0.3, max_tokens: cfg('summary_max_tokens', 2000) });
+      agent_response = (rule_final && rule_final.trim().length > 0 && !parse_tool_call(rule_final))
+        ? rule_final
+        : compress(plan_log, cfg('plan_log_max_tokens', 4000));
+    }
+
     if (!agent_response || agent_response.trim().length < 5)
       agent_response = compress(plan_log, cfg('plan_log_max_tokens', 4000));
 
@@ -379,18 +395,30 @@ function shannon_agent_run(user_message, conversation_id) {
     return agent_response;
   }
 
-  /* ROUTE C: RAG / knowledge base */
+  /* ROUTE C: RAG / knowledge base.
+   *
+   * Only claim the turn when a vector store actually exists.  Previously any
+   * message is_knowledge_query() liked was answered with heatwave_dispatch's
+   * "未找到向量知识库。" dead end whenever no vector store was configured —
+   * which is the default state of a fresh instance, so the whole route was a
+   * dead end out of the box.  is_knowledge_query() is also lexical and
+   * imprecise (its '有哪些' alternative matches "orders 表有哪些列？"), so a
+   * plain schema question could be swallowed here and never reach the agent
+   * loop that could actually answer it.  Falling through costs one
+   * information_schema lookup and lets Route D handle it instead. */
   if (is_knowledge_query(user_message)) {
     var vector_tables = discover_vector_tables(chat_opt);
-    var hw_result     = heatwave_dispatch(user_message, chat_opt, vector_tables);
-    agent_response    = hw_result.response || '';
-    if (hw_result.tables && hw_result.tables.length > 0)
-      chat_opt.tables = hw_result.tables;
-    chat_opt = update_chat_history(chat_opt, user_message, agent_response);
-    chat_opt.response = agent_response; chat_opt.request_completed = true;
-    save_chat_options(chat_opt);
-    persist_turn(conversation_id, user_message, agent_response, 'hw_mode:' + hw_result.mode + think_suffix());
-    return agent_response;
+    if (vector_tables && vector_tables.length > 0) {
+      var hw_result  = heatwave_dispatch(user_message, chat_opt, vector_tables);
+      agent_response = hw_result.response || '';
+      if (hw_result.tables && hw_result.tables.length > 0)
+        chat_opt.tables = hw_result.tables;
+      chat_opt = update_chat_history(chat_opt, user_message, agent_response);
+      chat_opt.response = agent_response; chat_opt.request_completed = true;
+      save_chat_options(chat_opt);
+      persist_turn(conversation_id, user_message, agent_response, 'hw_mode:' + hw_result.mode + think_suffix());
+      return agent_response;
+    }
   }
 
   /* ROUTE D: LLM Agent Loop */
@@ -429,6 +457,9 @@ function shannon_agent_run(user_message, conversation_id) {
 
   var tool_log = '', last_result = '', need_summary = false, error_count = 0;
   var seen_tool_sigs = {};
+  /* Signatures whose execution failed.  A later successful step may have
+   * removed whatever made them fail, so they stop counting as repeats. */
+  var failed_tool_sigs = {};
   var tx_turns = 0;
 
   for (var turn = 0; turn < MAX_TURNS; turn++) {
@@ -529,15 +560,42 @@ function shannon_agent_run(user_message, conversation_id) {
                   (tool_obj.args && tool_obj.args.sql) ? tool_obj.args.sql : '',
                   tool_obj.thought, result_text);
 
-    if (!result_obj.ok) {
-      tool_log += '\n[执行失败] ' + (result_obj.error || 'unknown_error') + '\n';
+    /* Single consecutive-error counter for the whole turn.  A step counts as
+     * failed either because execute_review_step reported ok=false, or because
+     * the result text carries a SQL error that came back as an ordinary
+     * string.  These used to be two separate checks further apart, and the
+     * second one's `else { error_count = 0; }` reset the counter right after
+     * the first had incremented it — so a tool that kept failing never
+     * reached MAX_ERRORS and the loop ran all MAX_TURNS rounds. */
+    var step_failed = !result_obj.ok ||
+        result_text.indexOf('执行出错') !== -1 ||
+        result_text.indexOf('Error: ') !== -1  ||
+        result_text.indexOf('Unknown table') !== -1;
+
+    if (step_failed) {
+      failed_tool_sigs[cur_sig] = true;
+      if (!result_obj.ok)
+        tool_log += '\n[执行失败] ' + (result_obj.error || 'unknown_error') + '\n';
       if (++error_count >= MAX_ERRORS) {
-        tool_log += '\n[终止] 结果校验失败次数过多。';
+        tool_log +=
+          '\n' + t('[终止] 连续错误，强制摘要。', '[Aborted] Consecutive errors, forcing summary.');
+        last_result  = result_text;
         need_summary = true;
         break;
       }
     } else {
       error_count = 0;
+      /* This step changed the database, so a call that failed earlier may now
+       * succeed -- e.g. ALTER TABLE ... SECONDARY_LOAD after the preceding
+       * turn set SECONDARY_ENGINE = RAPID.  Retrying it is progress, not a
+       * loop, so drop the failed signatures.  Signatures of steps that
+       * SUCCEEDED stay recorded, so a model that keeps re-issuing the same
+       * working call is still cut off. */
+      for (var fsig in failed_tool_sigs) {
+        if (Object.prototype.hasOwnProperty.call(failed_tool_sigs, fsig))
+          delete seen_tool_sigs[fsig];
+      }
+      failed_tool_sigs = {};
     }
 
     var loop_tx_ctx = get_tx_context();
@@ -562,16 +620,6 @@ function shannon_agent_run(user_message, conversation_id) {
       break;
     }
 
-    if (result_text.indexOf('执行出错') !== -1 ||
-        result_text.indexOf('Error: ') !== -1  ||
-        result_text.indexOf('Unknown table') !== -1) {
-      if (++error_count >= MAX_ERRORS) {
-        tool_log +=
-          '\n' + t('[终止] 连续错误，强制摘要。', '[Aborted] Consecutive errors, forcing summary.');
-        break;
-      }
-    } else { error_count = 0; }
-
     tool_log += '\n[Step ' + (turn+1) + '] tool=' + tool_obj.tool +
                 ' thought=' + (tool_obj.thought || '') +
                 '\nresult=' + compress(result_text, 1200) + '\n';
@@ -591,10 +639,16 @@ function shannon_agent_run(user_message, conversation_id) {
       break;
     }
 
+    /* Terminal ML tools: the tool result IS the answer, so stop the loop.
+     * ml_model_load / ml_model_unload are deliberately NOT here — loading a
+     * model is a prerequisite step the agent should follow with the
+     * prediction the user actually asked for, and ml_model_active is a
+     * lookup the model should summarize rather than dump verbatim. */
     if (['ml_train','ml_predict_row','ml_predict_table',
          'ml_explain','ml_explain_row','ml_explain_table',
          'ml_score','ml_model_export','ml_model_import',
-         'ml_list_models'].indexOf(tool_obj.tool) !== -1) {
+         'ml_list_models','ml_embed_table','ml_generate_table',
+         'ml_rag_table'].indexOf(tool_obj.tool) !== -1) {
       if (result_obj.ok && result_text && result_text.length > 0) {
         agent_response = result_text;
         need_summary = false;
@@ -644,11 +698,15 @@ function shannon_agent_run(user_message, conversation_id) {
 
   /* Safety net: catch raw SQL table-format output that leaked through,
      as well as stray JSON tool calls */
-  var looks_like_raw_sql = agent_response && (
-    agent_response.indexOf('共 ') === 0 ||
-    agent_response.indexOf('---') !== -1 ||
-    (agent_response.indexOf(' | ') !== -1 && agent_response.indexOf('\n') !== -1)
-  );
+  /* Anchor on the exact header rows_to_text()/rows_to_table() emit ("共 N
+   * 条：" / "Total N rows:") rather than on '---' or ' | ' anywhere in the
+   * text.  final_summary() explicitly instructs the model to answer with a
+   * Markdown table first, and every Markdown table contains both of those
+   * substrings — so the loose test fired on essentially every well-formed
+   * tool-using answer, throwing away a good response and paying for a
+   * redundant final_summary() round trip. */
+  var looks_like_raw_sql = !!agent_response &&
+    /^(?:共\s*\d+\s*条：|Total\s+\d+\s+rows:)/.test(agent_response);
   /* Reuse parse_tool_call() instead of a weak charAt(0)==='{' check —
    * the latter misses JSON wrapped in ```json fences, which is the most
    * common leakage pattern from chat models that have been exposed to
@@ -693,4 +751,3 @@ function shannon_agent_run(user_message, conversation_id) {
   }
 }
 
-return shannon_agent_run(user_message, conversation_id);

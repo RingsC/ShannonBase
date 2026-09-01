@@ -240,7 +240,13 @@ var ML_WRITE_TOOLS = {
   ml_predict_table:  { risk: 'medium', table_arg: 'output_table', fallback_arg: 'table_name', transactional: false },
   ml_explain_table:  { risk: 'medium', table_arg: 'output_table', fallback_arg: 'table_name', transactional: false },
   ml_model_export:   { risk: 'medium', table_arg: 'output_table', transactional: false },
-  ml_model_import:   { risk: 'high',   table_arg: 'model_handle', transactional: false }
+  ml_model_import:   { risk: 'high',   table_arg: 'model_handle', transactional: false },
+  /* Batch routines write their results into an output table column, so they
+   * must go through the same approval gate as any other write rather than
+   * being mistaken for read-only because args carries no `sql`. */
+  ml_embed_table:    { risk: 'medium', table_arg: 'output_column',  transactional: false },
+  ml_generate_table: { risk: 'medium', table_arg: 'output_column',  transactional: false },
+  ml_rag_table:      { risk: 'medium', table_arg: 'output_column',  transactional: false }
 };
 
 function sql_lex_info(sql) {
@@ -383,6 +389,22 @@ function classify_statement(sql) {
   };
 }
 
+/**
+ * Does this DDL statement destroy data or schema objects?
+ *
+ * DROP anywhere at the top level covers DROP TABLE / DROP DATABASE and also
+ * ALTER TABLE ... DROP COLUMN / DROP INDEX, which are equally irreversible
+ * from the agent's point of view.  TRUNCATE is included for the obvious
+ * reason.  Deliberately conservative: this only gates a statement behind an
+ * explicit operator opt-in (review_policy.allow_destructive_ddl), so erring
+ * toward "destructive" costs a configuration flag, never data.
+ */
+function is_destructive_ddl(sql) {
+  var lex = sql_lex_info(sql);
+  if (lex.first_keyword === 'TRUNCATE') return true;
+  return lex.top_tokens.indexOf('DROP') !== -1;
+}
+
 function try_recover_unknown_table(result, original_sql) {
   if (!result || result.indexOf('Unknown table') === -1) return null;
   var m = result.match(/Unknown table\s+'?(?:[\w]+\.)?([\w]+)'?/i);
@@ -454,6 +476,14 @@ function logical_plan_to_hint(tasks, schema_from_embeddings) {
 }
 
 function rule_planner(msg, db) {
+
+  /* Every route below is read-only introspection.  A request to CREATE an
+   * index, ALTER a table or SECONDARY_LOAD one contains the very same nouns
+   * these patterns key on ("索引", "表结构"), so without this guard an action
+   * request was answered with a catalog dump and the DDL never happened.
+   * Hand those to the agent loop, which has run_ddl. */
+  if (/建立?索引|创建索引|新建索引|加索引|添加索引|删除索引|建表|创建表|新建表|删表|删除表|改表|修改表结构|加载到|卸载|secondary_?load|secondary_?unload|\bcreate\s+(table|index|database|schema)\b|\balter\s+table\b|\bdrop\s+(table|index|database|schema)\b|\btruncate\b|\brename\s+table\b|\badd\s+index\b/i.test(String(msg || '')))
+    return null;
 
   if (/有哪些(数据库|schema)|所有数据库|列出.*数据库|show.?databases|show.?schemas|list.*databases/i.test(msg)) {
     return [
@@ -645,6 +675,25 @@ function validate_tool_call(tool_obj, policy) {
       if (!args.sql || typeof args.sql !== 'string' || args.sql.trim().length < 5)
         return t('update_data 缺少有效 sql 参数', 'update_data missing valid sql argument');
       break;
+    case 'run_ddl': {
+      if (!args.sql || typeof args.sql !== 'string' || args.sql.trim().length < 5)
+        return t('run_ddl 缺少有效 sql 参数', 'run_ddl missing valid sql argument');
+      var ddl_stmt = classify_statement(String(args.sql));
+      if (ddl_stmt.multiple_statements)
+        return t('run_ddl 仅允许单条 DDL 语句', 'run_ddl accepts a single DDL statement only');
+      if (!ddl_stmt.is_ddl)
+        return t('run_ddl 仅允许 DDL（CREATE/ALTER/DROP/TRUNCATE/RENAME）；' +
+                 '读查询用 query_db，写数据用 update_data。',
+                 'run_ddl only accepts DDL (CREATE/ALTER/DROP/TRUNCATE/RENAME); ' +
+                 'use query_db to read and update_data to write rows.');
+      if (is_destructive_ddl(String(args.sql)) &&
+          !(policy && policy.allow_destructive_ddl))
+        return t('该 DDL 会删除数据或对象，默认禁止；如确需执行请设置 ' +
+                 '@chat_options.allow_destructive_ddl=true。',
+                 'This DDL drops data or objects and is refused by default; set ' +
+                 '@chat_options.allow_destructive_ddl=true if it is really intended.');
+      break;
+    }
     case 'plan_sql':
       if (!Array.isArray(args.steps) || args.steps.length === 0)
         return t('plan_sql 缺少 steps 数组，或 steps 为空',
@@ -771,6 +820,34 @@ function validate_tool_call(tool_obj, policy) {
       if (!args.model_handle || typeof args.model_handle !== 'string')
         return t('ml_model_import 缺少 model_handle 参数',
                  'ml_model_import missing model_handle argument');
+      break;
+    case 'ml_model_load':
+    case 'ml_model_unload':
+      /* model_handle may be omitted when @chat_options.handle_model is set;
+       * execute_tool resolves it and fails there if neither is present. */
+      if (args.model_handle !== undefined && typeof args.model_handle !== 'string')
+        return t(tool_obj.tool + ' 的 model_handle 必须是字符串',
+                 tool_obj.tool + ' model_handle must be a string');
+      break;
+    case 'ml_model_active':
+      if (args.user !== undefined &&
+          ['current', 'all'].indexOf(String(args.user).toLowerCase()) === -1)
+        return t('ml_model_active 的 user 只能是 current 或 all',
+                 'ml_model_active user must be either current or all');
+      break;
+    case 'ml_embed_table':
+    case 'ml_generate_table':
+    case 'ml_rag_table':
+      if (!valid_table_column_ref(args.input_column))
+        return t(tool_obj.tool + ' 的 input_column 必须是 DBName.TableName.ColumnName 格式',
+                 tool_obj.tool + ' input_column must be in DBName.TableName.ColumnName format');
+      if (!valid_table_column_ref(args.output_column))
+        return t(tool_obj.tool + ' 的 output_column 必须是 DBName.TableName.ColumnName 格式',
+                 tool_obj.tool + ' output_column must be in DBName.TableName.ColumnName format');
+      if (args.options !== undefined &&
+          (typeof args.options !== 'object' || Array.isArray(args.options)))
+        return t(tool_obj.tool + ' 的 options 必须是 JSON 对象',
+                 tool_obj.tool + ' options must be a JSON object');
       break;
     default:
       return t('未知工具：', 'Unknown tool: ') + tool_obj.tool;
@@ -987,17 +1064,13 @@ function execute_tool(tool, args, db) {
   }
 
   if (tool === 'update_data') {
-    var write_ctx = get_tx_context();
-    if (!write_ctx.active || write_ctx.owner === TX_OWNER_UNKNOWN)
-      return { ok: false,
-               response: t('拒绝：写操作必须在明确的事务内，请先 begin_tx，或由调用者先 START TRANSACTION。',
-                           'Rejected: writes require a known active transaction; call begin_tx or have the caller START TRANSACTION first.'),
-               error: 'transaction_required' };
-
     sql = replace_ph(String(args.sql || ''), db);
     var stmt3 = classify_statement(sql);
     first = stmt3.dml_keyword || stmt3.first_keyword;
 
+    /* Statement-shape checks first: they depend only on the SQL, so the model
+     * gets the actionable message ("use run_ddl") regardless of whether a
+     * transaction happens to be open. */
     if (stmt3.multiple_statements)
       return { ok: false,
                response: t('拒绝：update_data 仅允许单条 DML 语句。',
@@ -1006,8 +1079,8 @@ function execute_tool(tool, args, db) {
 
     if (!stmt3.is_write)
       return { ok: false,
-               response: t('拒绝：update_data 仅允许 INSERT/UPDATE/DELETE/REPLACE。',
-                           'Rejected: update_data only allows INSERT/UPDATE/DELETE/REPLACE.'),
+               response: t('拒绝：update_data 仅允许 INSERT/UPDATE/DELETE/REPLACE；DDL 请改用 run_ddl。',
+                           'Rejected: update_data only allows INSERT/UPDATE/DELETE/REPLACE; use run_ddl for DDL.'),
                error: 'invalid_write_sql' };
 
     if ((first === 'UPDATE' || first === 'DELETE') && !stmt3.has_top_level_where)
@@ -1015,6 +1088,13 @@ function execute_tool(tool, args, db) {
                response: t('拒绝：', 'Rejected: ') + first +
                          t(' 必须含顶层 WHERE 条件。', ' must contain a top-level WHERE clause.'),
                error: 'missing_where' };
+
+    var write_ctx = get_tx_context();
+    if (!write_ctx.active || write_ctx.owner === TX_OWNER_UNKNOWN)
+      return { ok: false,
+               response: t('拒绝：写操作必须在明确的事务内，请先 begin_tx，或由调用者先 START TRANSACTION。',
+                           'Rejected: writes require a known active transaction; call begin_tx or have the caller START TRANSACTION first.'),
+               error: 'transaction_required' };
 
     try {
       var raw_result = sys.exec_sql(sql);
@@ -1027,6 +1107,44 @@ function execute_tool(tool, args, db) {
     } catch (e) {
       return { ok: false, response: t('写操作执行失败：', 'Write execution failed: ') + String(e),
                error: 'write_failed', sql: sql };
+    }
+  }
+
+  if (tool === 'run_ddl') {
+    sql = replace_ph(String(args.sql || ''), db);
+    var stmt_ddl = classify_statement(sql);
+
+    if (stmt_ddl.multiple_statements)
+      return { ok: false,
+               response: t('拒绝：run_ddl 仅允许单条 DDL 语句。',
+                           'Rejected: run_ddl accepts exactly one DDL statement.'),
+               error: 'multi_statement_rejected' };
+    if (!stmt_ddl.is_ddl)
+      return { ok: false,
+               response: t('拒绝：run_ddl 仅允许 DDL 语句。',
+                           'Rejected: run_ddl only allows DDL statements.'),
+               error: 'invalid_ddl_sql' };
+
+    /* DDL implicitly commits whatever transaction is open.  Refuse rather
+     * than silently committing the caller's -- or the agent's own -- work
+     * as a side effect of an ALTER. */
+    var ddl_ctx = get_tx_context();
+    if (ddl_ctx.active)
+      return { ok: false,
+               response: t('拒绝：当前有活跃事务，执行 DDL 会隐式提交它。请先 COMMIT 或 ROLLBACK，再执行 DDL。',
+                           'Rejected: a transaction is open and DDL would implicitly commit it. ' +
+                           'COMMIT or ROLLBACK first, then run the DDL.'),
+               error: 'ddl_would_commit_transaction' };
+
+    try {
+      query_checked(sql);
+      return { ok: true,
+               response: t('DDL 执行成功：', 'DDL executed successfully: ') + compress(sql, 300),
+               sql: sql };
+    } catch (e) {
+      return { ok: false,
+               response: t('DDL 执行失败：', 'DDL execution failed: ') + String(e),
+               error: 'ddl_failed', sql: sql };
     }
   }
 
@@ -1360,6 +1478,121 @@ function execute_tool(tool, args, db) {
     }
   }
 
+  /* === Model lifecycle: load into / unload from RAPID memory ===
+   * ML_PREDICT_* / ML_EXPLAIN_* operate on a model that is resident in
+   * memory, so a freshly trained-and-forgotten or re-imported handle has to
+   * be loaded before it can serve predictions. */
+  if (tool === 'ml_model_load' || tool === 'ml_model_unload') {
+    var lc_chat_opt = get_chat_options();
+    var lc_handle = String(args.model_handle ||
+                    (lc_chat_opt && lc_chat_opt.handle_model ? lc_chat_opt.handle_model : '') || '');
+    if (!lc_handle)
+      return { ok: false,
+               response: t('缺少 model_handle（也未在 @chat_options.handle_model 中预设）。',
+                           'Missing model_handle (and none preset in @chat_options.handle_model).'),
+               error: 'ml_model_handle_missing' };
+    var lc_sql;
+    if (tool === 'ml_model_load') {
+      var lc_user = args.user ? "'" + esc(String(args.user)) + "'" : 'NULL';
+      lc_sql = "CALL sys.ML_MODEL_LOAD('" + esc(lc_handle) + "', " + lc_user + ")";
+    } else {
+      lc_sql = "CALL sys.ML_MODEL_UNLOAD('" + esc(lc_handle) + "')";
+    }
+    try {
+      query_checked(lc_sql);
+      return { ok: true,
+               response: (tool === 'ml_model_load'
+                 ? t('模型已加载到内存：', 'Model loaded into memory: ')
+                 : t('模型已从内存卸载：', 'Model unloaded from memory: ')) + lc_handle,
+               sql: lc_sql, model_handle: lc_handle };
+    } catch (e) {
+      return { ok: false,
+               response: (tool === 'ml_model_load' ? 'ML_MODEL_LOAD' : 'ML_MODEL_UNLOAD') +
+                         t(' 失败：', ' failed: ') + String(e),
+               error: tool + '_failed' };
+    }
+  }
+
+  /* === Which models are resident in memory, and how much do they cost === */
+  if (tool === 'ml_model_active') {
+    var ac_user = args.user ? String(args.user).toLowerCase() : 'current';
+    var ac_set  = "SET @_ml_active_info = NULL";
+    var ac_call = "CALL sys.ML_MODEL_ACTIVE('" + esc(ac_user) + "', @_ml_active_info)";
+    var ac_sel  = "SELECT @_ml_active_info AS active_models";
+    try {
+      query_checked(ac_set);
+      query_checked(ac_call);
+      var ac_res = query_checked(ac_sel);
+      return { ok: true,
+               response: t('内存中已加载的模型：\n', 'Models currently loaded in memory:\n') +
+                         compress(rows_to_text(ac_res), 2000),
+               sql: ac_set + ";\n" + ac_call + ";\n" + ac_sel };
+    } catch (e) {
+      return { ok: false,
+               response: t('ML_MODEL_ACTIVE 失败：', 'ML_MODEL_ACTIVE failed: ') + String(e),
+               error: 'ml_model_active_failed' };
+    }
+  }
+
+  /* === Batch routines over a whole table column ===
+   * ml_embed_table is what actually builds the vector store the RAG route
+   * searches, so it is the entry point for "index this text column as a
+   * knowledge base". */
+  if (tool === 'ml_embed_table' || tool === 'ml_generate_table' || tool === 'ml_rag_table') {
+    var bt_in  = String(args.input_column  || '');
+    var bt_out = String(args.output_column || '');
+    if (!valid_table_column_ref(bt_in) || !valid_table_column_ref(bt_out))
+      return { ok: false,
+               response: t('input_column / output_column 必须是 DBName.TableName.ColumnName 格式。',
+                           'input_column / output_column must be DBName.TableName.ColumnName.'),
+               error: 'invalid_table_column_ref' };
+
+    /* Copy rather than mutate the caller's args — the same object is stored
+     * verbatim in the review plan's args_json. */
+    var bt_opts = {};
+    if (args.options && typeof args.options === 'object')
+      Object.keys(args.options).forEach(function(k) { bt_opts[k] = args.options[k]; });
+
+    var bt_proc;
+    if (tool === 'ml_embed_table') {
+      bt_proc = 'sys.ML_EMBED_TABLE';
+      if (!bt_opts.model_id) bt_opts.model_id = get_embed_model_id();
+      /* ML_EMBED_TABLE reads this as CAST(JSON_UNQUOTE(...) AS UNSIGNED), so a
+       * JSON boolean unquotes to 'true' and fails with ER_TRUNCATED_WRONG_VALUE.
+       * It wants 1/0.  (ML_EMBED_ROW, used elsewhere, does accept true.) */
+      if (bt_opts.truncate === undefined) bt_opts.truncate = 1;
+      else bt_opts.truncate = bt_opts.truncate ? 1 : 0;
+    } else if (tool === 'ml_generate_table') {
+      bt_proc = 'sys.ML_GENERATE_TABLE';
+      var gen_model_opts = (get_chat_options() || {}).model_options || {};
+      if (!bt_opts.task)     bt_opts.task = 'generation';
+      if (!bt_opts.language) bt_opts.language = A.lang;
+      if (!bt_opts.model_id && gen_model_opts.model_id)
+        bt_opts.model_id = gen_model_opts.model_id;
+    } else {
+      bt_proc = 'sys.ML_RAG_TABLE';
+      var rag_defaults = get_rag_options(get_chat_options());
+      Object.keys(rag_defaults).forEach(function(k) {
+        if (!(k in bt_opts)) bt_opts[k] = rag_defaults[k];
+      });
+    }
+
+    var bt_sql = "CALL " + bt_proc + "('" + esc(bt_in) + "','" + esc(bt_out) + "'," +
+                 "CAST('" + esc(JSON.stringify(bt_opts)) + "' AS JSON))";
+    try {
+      var bt_res = query_checked(bt_sql);
+      return { ok: true,
+               response: bt_proc.replace('sys.', '') +
+                         t(' 执行完成，结果写入 ', ' completed, output written to ') + bt_out +
+                         '\n' + compress(rows_to_text(bt_res), 2000),
+               sql: bt_sql };
+    } catch (e) {
+      return { ok: false,
+               response: bt_proc.replace('sys.', '') + t(' 失败：', ' failed: ') + String(e),
+               error: tool + '_failed' };
+    }
+  }
+
   /* === List models (helper) === */
   if (tool === 'ml_list_models') {
     try {
@@ -1396,6 +1629,10 @@ function get_review_policy(chat_opt) {
     auto_execute_read_only: cfg.auto_execute_read_only !== false,
     require_approval_for_write: cfg.require_approval_for_write !== false,
     require_approval_for_ddl: cfg.require_approval_for_ddl !== false,
+    /* Opt-in, and unlike the require_approval_* flags this one is enforced
+     * even when review_mode is off: DROP / TRUNCATE are irreversible, so the
+     * agent never issues them unless an operator has explicitly said it may. */
+    allow_destructive_ddl: cfg.allow_destructive_ddl === true,
     require_approval_for_risky_sql: cfg.require_approval_for_risky_sql !== false,
     max_pending_steps: Math.max(1, Number(cfg.max_pending_steps || 3)),
     /* How long an awaiting_approval plan may sit untouched before it's
@@ -1421,7 +1658,10 @@ function normalize_review_command(text) {
 
 function parse_review_modify(text) {
   var s = String(text || '').trim();
-  var m = s.match(/^(?:modify|修改)\s*[:：]?\s*(.+)$/i);
+  /* [\s\S] rather than . — '.' does not match a newline, so a pasted
+   * multi-line "Modify: UPDATE ...\n  WHERE ..." failed the anchored match
+   * entirely and was reported as a format error. */
+  var m = s.match(/^(?:modify|修改)\s*[:：]?\s*([\s\S]+)$/i);
   return m && m[1] ? m[1].trim() : null;
 }
 
@@ -1506,6 +1746,14 @@ function ml_display_sql(tool_name, args) {
              (args.model_content ? "(SELECT MODEL_OBJECT FROM " + esc(String(args.model_content)) + " LIMIT 1)" : 'NULL') +
              ", CAST('" + esc(JSON.stringify({task: args.task || 'classification'})) + "' AS JSON), " + at_h + ")";
 
+    case 'ml_embed_table':
+    case 'ml_generate_table':
+    case 'ml_rag_table':
+      return 'CALL sys.' + tool_name.toUpperCase() + "('" +
+             esc(String(args.input_column || '')) + "','" +
+             esc(String(args.output_column || '')) + "'," +
+             (opt_json ? "'" + esc(opt_json) + "'" : 'NULL') + ')';
+
     default:
       return 'CALL sys.' + tool_name.toUpperCase() + '(' +
              Object.keys(args || {}).map(function(k) {
@@ -1554,7 +1802,9 @@ function build_review_step(tool_obj, args, db, compute_estimate) {
     writes: ml_meta ? true : stmt4.is_write,
     ddl: stmt4.is_ddl,
     risk: ml_meta ? ml_meta.risk : stmt4.risk,
-    transactional: ml_meta ? (ml_meta.transactional !== false) : true,
+    /* DDL implicitly commits, so it must never be wrapped in an explicit
+     * BEGIN/COMMIT by execute_review_step. */
+    transactional: ml_meta ? (ml_meta.transactional !== false) : !stmt4.is_ddl,
     estimated_rows: ml_meta ? t('不适用（ML 存储过程）', 'n/a (ML procedure)') : 'unknown',
     thought: tool_obj && tool_obj.thought ? tool_obj.thought : ''
   };
@@ -1580,20 +1830,28 @@ function build_review_step(tool_obj, args, db, compute_estimate) {
 }
 
 function evaluate_step_policy(step, policy) {
-  /* DDL (CREATE/ALTER/DROP/TRUNCATE/RENAME) is not supported by the
-   * current tool set — reject it immediately regardless of review_mode,
-   * so the user never sees a misleading "approve this DDL" prompt for
-   * something that can never execute successfully. */
-  if (step && step.ddl)
-    return { action: 'reject', reason: 'ddl_not_supported',
-             message: t('DDL 语句当前不支持通过 agent 执行。',
-                        'DDL statements are not supported via the agent.') };
-  if (!policy || policy.review_mode !== 'review')
-    return { action: 'execute', reason: 'review_disabled' };
-
+  var is_ddl   = !!(step && step.ddl);
   var is_write = !!(step && step.writes);
   var is_risky = !!(step && step.risk === 'high');
 
+  /* Destructive DDL is refused regardless of review_mode unless an operator
+   * has opted in.  Everything else about DDL is a policy decision below --
+   * it used to be rejected outright here, which made require_approval_for_ddl
+   * dead code and left ALTER TABLE ... SECONDARY_LOAD (a prerequisite of
+   * ml_train) impossible to perform through the agent at all. */
+  if (is_ddl && step.sql && is_destructive_ddl(step.sql) &&
+      !(policy && policy.allow_destructive_ddl))
+    return { action: 'reject', reason: 'destructive_ddl_not_allowed',
+             message: t('该语句会删除数据或对象，agent 默认不执行；如确需执行，' +
+                        '请在 @chat_options 中设置 allow_destructive_ddl=true。',
+                        'This statement drops data or objects. The agent will not run it ' +
+                        'unless allow_destructive_ddl=true is set in @chat_options.') };
+
+  if (!policy || policy.review_mode !== 'review')
+    return { action: 'execute', reason: 'review_disabled' };
+
+  if (is_ddl && policy.require_approval_for_ddl)
+    return { action: 'pause', reason: 'ddl_requires_approval' };
   if (is_write && policy.require_approval_for_write)
     return { action: 'pause', reason: 'write_requires_approval' };
   if (is_risky && policy.require_approval_for_risky_sql)
@@ -1604,7 +1862,7 @@ function evaluate_step_policy(step, policy) {
    * whether the step actually wrote anything, so a write step could slip
    * through mislabeled as 'safe_read_only' whenever an operator had
    * disabled require_approval_for_write for an unrelated reason. */
-  if (!is_write && policy.auto_execute_read_only)
+  if (!is_write && !is_ddl && policy.auto_execute_read_only)
     return { action: 'execute', reason: 'safe_read_only' };
 
   /* Reaching here means the step IS a write or high-risk statement, but
@@ -1613,7 +1871,7 @@ function evaluate_step_policy(step, policy) {
    * operator's explicit intent — but under its own accurate reason instead
    * of borrowing 'safe_read_only', so audit logs reflect what actually
    * happened. */
-  if (is_write || is_risky)
+  if (is_write || is_ddl || is_risky)
     return { action: 'execute', reason: 'approval_explicitly_disabled_by_policy' };
 
   return { action: 'pause', reason: 'review_mode' };
@@ -1754,7 +2012,7 @@ function load_review_state(conv_id) {
   if (!conv_id) return null;
   try {
     var rows = query(
-      "SELECT plan_id, status, current_step_index, total_steps, description, plan_json " +
+      "SELECT plan_id, conversation_id, status, current_step_index, total_steps, description, plan_json " +
       "FROM mysql.agent_review_plan " +
       "WHERE conversation_id='" + esc(conv_id) + "' AND status='awaiting_approval' " +
       "ORDER BY created_at DESC LIMIT 1"

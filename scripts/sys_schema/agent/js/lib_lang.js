@@ -9,6 +9,12 @@ var TABLE_LIST_PATTERN_SRC =
 
 function t(zh, en) { return A.lang === 'zh' ? zh : en; }
 
+/* Escape a value for use inside a single-quoted SQL string literal.
+ * Deliberately does NOT touch backticks: a backtick has no special meaning
+ * inside a string literal, and doubling it corrupted the value — a user
+ * message such as "SELECT * FROM `orders`" reached the LLM prompt and
+ * mysql.agent_memory as "SELECT * FROM ``orders``".  Use esc_ident() for
+ * text that is being placed between backticks. */
 function esc(s) {
   return String(s == null ? '' : s)
     .replace(/\\/g, '\\\\')
@@ -16,8 +22,12 @@ function esc(s) {
     .replace(/\n/g, '\\n')
     .replace(/\r/g, '\\r')
     .replace(/\x1a/g, '\\Z')
-    .replace(/'/g,  "''")
-    .replace(/`/g,  '``');
+    .replace(/'/g,  "''");
+}
+
+/* Escape an identifier for use between backticks. */
+function esc_ident(s) {
+  return String(s == null ? '' : s).replace(/`/g, '``');
 }
 
 function esc_like(s) {
@@ -37,6 +47,18 @@ function esc_qualified_ident(s) {
     if (!valid_ident(parts[i])) return null;
   }
   return parts.map(function(p) { return '`' + p + '`'; }).join('.');
+}
+
+/* Validate a "DBName.TableName.ColumnName" reference, the argument shape the
+ * batch ML routines (ML_EMBED_TABLE / ML_GENERATE_TABLE / ML_RAG_TABLE) take
+ * for their input and output columns. */
+function valid_table_column_ref(s) {
+  var parts = String(s || '').split('.');
+  if (parts.length !== 3) return false;
+  for (var i = 0; i < parts.length; i++) {
+    if (!valid_ident(parts[i])) return false;
+  }
+  return true;
 }
 
 function classify_request(text) {
