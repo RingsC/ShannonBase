@@ -1,5 +1,30 @@
 # ShannonBase Workflow
 
+## AI pull request review
+
+Every pull request gets one AI review (a summary plus inline comments) from the
+[AI PR Review](./workflows/pr-review.yml) workflow. It runs on `opened`,
+`synchronize`, `reopened`, and `ready_for_review`, skips drafts and bots, and
+never checks out or executes PR code: it reads the diff through the GitHub API.
+
+- Comment `/review` on a pull request to request another review. Only
+  `OWNER`, `MEMBER`, and `COLLABORATOR` comments trigger a run.
+- Add the `skip-ai-review` label to opt a pull request out.
+- Review rules live in [pr-review-prompt.md](./pr-review-prompt.md).
+
+Setup: add the repository secret `PR_REVIEW_API_KEY` with a key for any
+OpenAI-compatible provider. The reviewer defaults to OpenAI
+(`https://api.openai.com/v1`, `gpt-4o-mini`); set the repository variables
+`PR_REVIEW_BASE_URL` and `PR_REVIEW_MODEL` to use another provider, for example:
+
+| Provider | `PR_REVIEW_BASE_URL` | `PR_REVIEW_MODEL` |
+| --- | --- | --- |
+| OpenAI | `https://api.openai.com/v1` | `gpt-4o-mini` |
+| DeepSeek | `https://api.deepseek.com/v1` | `deepseek-chat` |
+| OpenRouter | `https://openrouter.ai/api/v1` | `openrouter/auto` |
+
+The job fails with an explicit error until `PR_REVIEW_API_KEY` is set.
+
 ## Release
 
 ShannonBase make new releases via workflow [Release](./workflows/release.yml).
