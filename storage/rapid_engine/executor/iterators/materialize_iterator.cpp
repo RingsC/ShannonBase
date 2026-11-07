@@ -349,8 +349,7 @@ int VectorizedMaterializeIterator::ReadBatch(std::pmr::vector<ColumnChunk> &chun
   rows = 0;
   auto report_batches = create_scope_guard([&] {
     if (rows != 0)
-      RapidMonitor::rapid_counters.query_vectorized_materialize_batch_rows_total.fetch_add(rows,
-                                                                                           std::memory_order_relaxed);
+      RAPID_COUNT(query_vectorized_materialize_batch_rows_total, rows);
   });
 
   capacity = std::min(capacity, m_batch_capacity);

@@ -145,10 +145,13 @@ void collect_rapid_monitor_metrics(Metrics &metrics) {
   metrics.compact_last_run_duration_us = rapid_counters.compact_last_run_duration_us.load(std::memory_order_relaxed);
 
   //  Query Execution
+#if RAPID_INSTRUMENTATION
   metrics.query_scans_total = rapid_counters.query_scans_total.load(std::memory_order_relaxed);
   metrics.query_index_lookups_total = rapid_counters.query_index_lookups_total.load(std::memory_order_relaxed);
+#endif
   metrics.query_rows_read_total = rapid_counters.query_rows_read_total.load(std::memory_order_relaxed);
   metrics.query_offload_total = rapid_counters.query_offload_total.load(std::memory_order_relaxed);
+#if RAPID_INSTRUMENTATION
   metrics.query_vectorized_window_rows_total =
       rapid_counters.query_vectorized_window_rows_total.load(std::memory_order_relaxed);
   metrics.query_vectorized_window_simd_rows_total =
@@ -242,6 +245,7 @@ void collect_rapid_monitor_metrics(Metrics &metrics) {
       rapid_counters.query_vectorized_sort_rows_total.load(std::memory_order_relaxed);
   metrics.query_vectorized_sort_spill_rows_total =
       rapid_counters.query_vectorized_sort_spill_rows_total.load(std::memory_order_relaxed);
+#endif
   metrics.query_offload_fallback_total = rapid_counters.query_offload_fallback_total.load(std::memory_order_relaxed);
 
   //  Transactions
@@ -359,15 +363,20 @@ void print_rapid_monitor_info(FILE *file) {
   /*  Query Execution  */
   fprintf(file,
           "\n-- Query Execution --\n"
-          "rapid_query_scans_total               : %" PRIu64
-          "\n"
-          "rapid_query_index_lookups_total       : %" PRIu64
-          "\n"
           "rapid_query_rows_read_total           : %" PRIu64
           "\n"
           "rapid_query_offload_total             : %" PRIu64
           "\n"
-          "rapid_query_offload_fallback_total    : %" PRIu64
+          "rapid_query_offload_fallback_total    : %" PRIu64 "\n",
+          metrics.query_rows_read_total, metrics.query_offload_total,
+          metrics.query_offload_fallback_total);
+
+#if RAPID_INSTRUMENTATION
+  /*  Query Execution -- diagnosis only, compiled out of release builds.  */
+  fprintf(file,
+          "rapid_query_scans_total               : %" PRIu64
+          "\n"
+          "rapid_query_index_lookups_total       : %" PRIu64
           "\n"
           "rapid_query_vectorized_window_rows_total: %" PRIu64
           "\n"
@@ -378,10 +387,13 @@ void print_rapid_monitor_info(FILE *file) {
           "rapid_query_vectorized_window_spill_rows_total: %" PRIu64
           "\n"
           "rapid_query_vectorized_window_spill_bytes_total: %" PRIu64 "\n",
-          metrics.query_scans_total, metrics.query_index_lookups_total, metrics.query_rows_read_total,
-          metrics.query_offload_total, metrics.query_offload_fallback_total, metrics.query_vectorized_window_rows_total,
-          metrics.query_vectorized_window_simd_rows_total, metrics.query_vectorized_window_scalar_rows_total,
-          metrics.query_vectorized_window_spill_rows_total, metrics.query_vectorized_window_spill_bytes_total);
+          metrics.query_scans_total, metrics.query_index_lookups_total,
+          metrics.query_vectorized_window_rows_total,
+          metrics.query_vectorized_window_simd_rows_total,
+          metrics.query_vectorized_window_scalar_rows_total,
+          metrics.query_vectorized_window_spill_rows_total,
+          metrics.query_vectorized_window_spill_bytes_total);
+#endif
 
   /*  Transactions  */
   fprintf(file,

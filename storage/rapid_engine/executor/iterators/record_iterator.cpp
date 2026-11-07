@@ -413,7 +413,7 @@ int VectorizedRecordIterator::ReadBatch(std::pmr::vector<ColumnChunk> &chunks, s
   if (!SupportsBatchRead()) return BatchError();
   auto report_batches = create_scope_guard([&] {
     if (rows != 0 && strcmp(m_operator_name, "ref") == 0)
-      RapidMonitor::rapid_counters.query_vectorized_ref_batch_rows_total.fetch_add(rows, std::memory_order_relaxed);
+      RAPID_COUNT(query_vectorized_ref_batch_rows_total, rows);
   });
 
   if (!capacity) return 0;

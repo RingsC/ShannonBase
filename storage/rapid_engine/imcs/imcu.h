@@ -626,8 +626,7 @@ class Imcu : public MemoryObject {
         if (context->limit > 0 && context->rows_returned >= context->limit) return scanned - batch_size + i + 1;
       }
       if (unpacked_rows != 0)
-        RapidMonitor::rapid_counters.query_bitpacked_unpack_rows_total.fetch_add(unpacked_rows,
-                                                                                 std::memory_order_relaxed);
+        RAPID_COUNT(query_bitpacked_unpack_rows_total, unpacked_rows);
     }
 
     return scanned;
@@ -1012,8 +1011,7 @@ class Imcu : public MemoryObject {
           if (!proj_cus[j]->decode_packed_range(chunk_start, batch_size, packed_scratch[j].data(), packed_widths[j]))
             packed_widths[j] = 0;  // out of the stream: fall back per row
           else
-            RapidMonitor::rapid_counters.query_bitpacked_unpack_rows_total.fetch_add(batch_size,
-                                                                                     std::memory_order_relaxed);
+            RAPID_COUNT(query_bitpacked_unpack_rows_total, batch_size);
         }
       }
 
