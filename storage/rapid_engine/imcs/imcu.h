@@ -625,8 +625,7 @@ class Imcu : public MemoryObject {
         // rest of the block is skipped for good.
         if (context->limit > 0 && context->rows_returned >= context->limit) return scanned - batch_size + i + 1;
       }
-      if (unpacked_rows != 0)
-        RAPID_COUNT(query_bitpacked_unpack_rows_total, unpacked_rows);
+      if (unpacked_rows != 0) RAPID_COUNT(query_bitpacked_unpack_rows_total, unpacked_rows);
     }
 
     return scanned;

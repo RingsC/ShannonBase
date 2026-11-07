@@ -225,6 +225,22 @@ int ha_rapid::close() {
   return ShannonBase::SHANNON_SUCCESS;
 }
 
+/**
+  Statement end, and the only place the internal counters are sampled.
+
+  They are diagnosis, not an interface: SHOW STATUS does not publish them and a
+  release build does not even keep them (see RapidMonitor). A debug build can ask
+  for what the statement just contributed with
+  SET SESSION debug='+d,rapid_stats', which turns this into one error-log line
+  per statement. Sampling here rather than when a scan or an index walk ends is
+  what makes that line describe the whole statement: a bloom filter rejects rows
+  during the join probe, after the build side has finished scanning.
+*/
+int ha_rapid::reset() {
+  RAPID_LOG_STATS("stmt_end");
+  return ShannonBase::SHANNON_SUCCESS;
+}
+
 int ha_rapid::info(unsigned int flags) {
   if (!(flags & HA_STATUS_VARIABLE)) return ShannonBase::SHANNON_SUCCESS;
 

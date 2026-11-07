@@ -594,8 +594,7 @@ TruthValue Imcu::evaluate_predicate_truth_at_row(Rapid_scan_context *context, co
     if (dict && (cu->real_type() == MYSQL_TYPE_ENUM || cu->real_type() == MYSQL_TYPE_SET)) dict = nullptr;
 
     if (dict) {
-      if (simple->has_mysql_like())
-        RAPID_COUNT(query_like_scalar_rows_total, 1);
+      if (simple->has_mysql_like()) RAPID_COUNT(query_like_scalar_rows_total, 1);
       uint32 str_id = 0;
       std::memcpy(&str_id, cell.slot, sizeof(str_id));
       std::string_view str_val = dict->get_view(str_id);

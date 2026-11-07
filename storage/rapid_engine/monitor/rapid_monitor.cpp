@@ -28,6 +28,7 @@
 #include <inttypes.h>
 #include <atomic>
 #include <chrono>
+#include <mutex>
 #include <shared_mutex>
 
 #include "storage/rapid_engine/imcs/imcs.h"
@@ -368,8 +369,7 @@ void print_rapid_monitor_info(FILE *file) {
           "rapid_query_offload_total             : %" PRIu64
           "\n"
           "rapid_query_offload_fallback_total    : %" PRIu64 "\n",
-          metrics.query_rows_read_total, metrics.query_offload_total,
-          metrics.query_offload_fallback_total);
+          metrics.query_rows_read_total, metrics.query_offload_total, metrics.query_offload_fallback_total);
 
 #if RAPID_INSTRUMENTATION
   /*  Query Execution -- diagnosis only, compiled out of release builds.  */
@@ -387,12 +387,9 @@ void print_rapid_monitor_info(FILE *file) {
           "rapid_query_vectorized_window_spill_rows_total: %" PRIu64
           "\n"
           "rapid_query_vectorized_window_spill_bytes_total: %" PRIu64 "\n",
-          metrics.query_scans_total, metrics.query_index_lookups_total,
-          metrics.query_vectorized_window_rows_total,
-          metrics.query_vectorized_window_simd_rows_total,
-          metrics.query_vectorized_window_scalar_rows_total,
-          metrics.query_vectorized_window_spill_rows_total,
-          metrics.query_vectorized_window_spill_bytes_total);
+          metrics.query_scans_total, metrics.query_index_lookups_total, metrics.query_vectorized_window_rows_total,
+          metrics.query_vectorized_window_simd_rows_total, metrics.query_vectorized_window_scalar_rows_total,
+          metrics.query_vectorized_window_spill_rows_total, metrics.query_vectorized_window_spill_bytes_total);
 #endif
 
   /*  Transactions  */
@@ -407,5 +404,75 @@ void print_rapid_monitor_info(FILE *file) {
 
   fprintf(file, "\n==\n");
 }
+
+#if RAPID_INSTRUMENTATION
+namespace {
+/** The counters one error-log line reports, sampled once per statement. */
+struct StatsSnapshot {
+  uint64_t scans, bloom_checks, bloom_rejects, bloom_scan_rejects, bloom_disabled;
+  uint64_t parallel_rows, parallel_fallbacks;
+  uint64_t sort_rows, sort_spill, window_rows, window_spill;
+  uint64_t bitpack_unpack, bitpack_predicate, bitpack_aggregate, late_rows;
+};
+
+StatsSnapshot read_stats() {
+  const auto load = [](const std::atomic<uint64_t> &c) { return c.load(std::memory_order_relaxed); };
+  return {load(rapid_counters.query_scans_total),
+          load(rapid_counters.query_hash_join_bloom_checks_total),
+          load(rapid_counters.query_hash_join_bloom_rejects_total),
+          load(rapid_counters.query_hash_join_bloom_scan_rejects_total),
+          load(rapid_counters.query_hash_join_bloom_disabled_total),
+          load(rapid_counters.query_parallel_rows_total),
+          load(rapid_counters.query_parallel_fallbacks_total),
+          load(rapid_counters.query_vectorized_sort_rows_total),
+          load(rapid_counters.query_vectorized_sort_spill_rows_total),
+          load(rapid_counters.query_vectorized_window_rows_total),
+          load(rapid_counters.query_vectorized_window_spill_rows_total),
+          load(rapid_counters.query_bitpacked_unpack_rows_total),
+          load(rapid_counters.query_bitpacked_predicate_rows_total),
+          load(rapid_counters.query_bitpacked_aggregate_rows_total),
+          load(rapid_counters.query_late_predicate_rows_total)};
+}
+}  // namespace
+
+void log_rapid_counters(const char *tag, bool emit) {
+  // The baseline moves on every statement, so turning the flag on mid-session
+  // reports that statement rather than everything since the server started.
+  static std::mutex lock;
+  static StatsSnapshot previous{};
+
+  std::lock_guard<std::mutex> guard(lock);
+  const StatsSnapshot now = read_stats();
+  const StatsSnapshot delta = {now.scans - previous.scans,
+                               now.bloom_checks - previous.bloom_checks,
+                               now.bloom_rejects - previous.bloom_rejects,
+                               now.bloom_scan_rejects - previous.bloom_scan_rejects,
+                               now.bloom_disabled - previous.bloom_disabled,
+                               now.parallel_rows - previous.parallel_rows,
+                               now.parallel_fallbacks - previous.parallel_fallbacks,
+                               now.sort_rows - previous.sort_rows,
+                               now.sort_spill - previous.sort_spill,
+                               now.window_rows - previous.window_rows,
+                               now.window_spill - previous.window_spill,
+                               now.bitpack_unpack - previous.bitpack_unpack,
+                               now.bitpack_predicate - previous.bitpack_predicate,
+                               now.bitpack_aggregate - previous.bitpack_aggregate,
+                               now.late_rows - previous.late_rows};
+  previous = now;
+  if (!emit) return;
+
+  fprintf(stderr,
+          "RAPID_STATS [%s] scans=%" PRIu64 " bloom_checks=%" PRIu64 " bloom_rejects=%" PRIu64
+          " bloom_scan_rejects=%" PRIu64 " bloom_disabled=%" PRIu64 " parallel_rows=%" PRIu64
+          " parallel_fallbacks=%" PRIu64 " sort_rows=%" PRIu64 " sort_spill=%" PRIu64
+          " window_rows=%" PRIu64 " window_spill=%" PRIu64 " bitpack_unpack=%" PRIu64
+          " bitpack_predicate=%" PRIu64 " bitpack_aggregate=%" PRIu64 " late_rows=%" PRIu64 "\n",
+          tag, delta.scans, delta.bloom_checks, delta.bloom_rejects, delta.bloom_scan_rejects,
+          delta.bloom_disabled, delta.parallel_rows, delta.parallel_fallbacks, delta.sort_rows,
+          delta.sort_spill, delta.window_rows, delta.window_spill, delta.bitpack_unpack,
+          delta.bitpack_predicate, delta.bitpack_aggregate, delta.late_rows);
+}
+#endif
+
 }  // namespace RapidMonitor
 }  // namespace ShannonBase
